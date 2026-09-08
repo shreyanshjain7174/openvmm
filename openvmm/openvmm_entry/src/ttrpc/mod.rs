@@ -457,19 +457,23 @@ impl VmService {
                 controller.send(VmControllerRpc::Quit);
             }
         }
-        if let Some(task) = self.controller_task.take() {
-            task.await;
-        }
 
         // Complete any pending WaitVm with an error.
         if let Some((_, response)) = self.wait_vm_response.take() {
             response.send(Err(grpc_error(anyhow!("server shutting down"))));
         }
 
-        // Drain any remaining RPCs.
-        futures::future::join_all(self.rpc_tasks.drain(..)).await;
+        // Cancel the remaining RPCs so nothing else holds an `Arc<Vm>`, then drop the VM
+        // *before* joining the controller. `Vm` owns the SCSI, shutdown, and KVP senders,
+        // and a live sender keeps the matching detached device task running, which in turn
+        // stops the VM worker from ever finishing its stop. `teardown_vm` orders these the
+        // same way for the same reason.
+        self.cancel_rpc_tasks().await;
         if let Some(vm) = self.vm.take() {
             let _ = Arc::try_unwrap(vm).ok().expect("no more VM references");
+        }
+        if let Some(task) = self.controller_task.take() {
+            task.await;
         }
         drop(cancel_send);
         server_task.await
@@ -493,12 +497,68 @@ impl VmService {
             Err(err) => response.send(Err(grpc_error(err))),
         }
     }
+
+    async fn cancel_rpc_tasks(&mut self) {
+        futures::future::join_all(self.rpc_tasks.drain(..).map(Task::cancel)).await;
+    }
 }
 
 struct Vm {
     worker_rpc: mesh::Sender<VmRpc>,
-    scsi_rpc: Option<mesh::Sender<ScsiControllerRequest>>,
+    scsi_rpc: Vec<mesh::Sender<ScsiControllerRequest>>,
     consomme_rpc: Option<mesh::Sender<ConsommeRequest>>,
+    #[expect(
+        dead_code,
+        reason = "keeps the shutdown IC receiver alive for the VM lifetime"
+    )]
+    shutdown_ic: mesh::Sender<hyperv_ic_resources::shutdown::ShutdownRpc>,
+    #[expect(
+        dead_code,
+        reason = "keeps the KVP IC receiver alive for the VM lifetime"
+    )]
+    kvp_ic: mesh::Sender<hyperv_ic_resources::kvp::KvpConnectRpc>,
+}
+
+fn lcow_scsi_controller_ids() -> [Guid; 4] {
+    [
+        guid::guid!("df6d0690-79e5-55b6-a5ec-c1e2f77f580a"),
+        guid::guid!("0110f83b-de10-5172-a266-78bca56bf50a"),
+        guid::guid!("b5d2d8d4-3a75-51bf-945b-3444dc6b8579"),
+        guid::guid!("305891a9-b251-5dfe-91a2-c25d9212275b"),
+    ]
+}
+
+struct HypervIcResources {
+    devices: Vec<(DeviceVtl, Resource<VmbusDeviceHandleKind>)>,
+    shutdown_ic: mesh::Sender<hyperv_ic_resources::shutdown::ShutdownRpc>,
+    kvp_ic: mesh::Sender<hyperv_ic_resources::kvp::KvpConnectRpc>,
+}
+
+fn build_hyperv_ic_resources() -> HypervIcResources {
+    let (shutdown_ic, shutdown_recv) = mesh::channel();
+    let (kvp_ic, kvp_recv) = mesh::channel();
+    let devices = vec![
+        (
+            DeviceVtl::Vtl0,
+            hyperv_ic_resources::shutdown::ShutdownIcHandle {
+                recv: shutdown_recv,
+            }
+            .into_resource(),
+        ),
+        (
+            DeviceVtl::Vtl0,
+            hyperv_ic_resources::timesync::TimesyncIcHandle.into_resource(),
+        ),
+        (
+            DeviceVtl::Vtl0,
+            hyperv_ic_resources::kvp::KvpIcHandle { recv: kvp_recv }.into_resource(),
+        ),
+    ];
+    HypervIcResources {
+        devices,
+        shutdown_ic,
+        kvp_ic,
+    }
 }
 
 enum VmLifecycle {
@@ -575,6 +635,7 @@ impl VmService {
             vmservice::Vm::Quit((), response) => {
                 // Shut down the controller (which stops and joins the worker).
                 // Drop the VM's device RPC channels first; see `teardown_vm`.
+                self.cancel_rpc_tasks().await;
                 self.vm.take();
                 if let Some(controller) = self.vm_controller.take() {
                     controller.send(VmControllerRpc::Quit);
@@ -952,28 +1013,22 @@ impl VmService {
             }
         };
 
-        let mut scsi_rpc = None;
+        let mut controller_devices: [Vec<ScsiDeviceAndPath>; 4] =
+            std::array::from_fn(|_| Vec::new());
         let mut consomme_rpc = None;
+        let hyperv_ic = build_hyperv_ic_resources();
+        config.vmbus_devices.extend(hyperv_ic.devices);
         if let Some(devices_config) = req_config.devices_config {
-            if !devices_config.scsi_disks.is_empty() {
-                let mut devices = Vec::new();
-                for disk in devices_config.scsi_disks {
-                    devices.push(make_disk_config(disk).await?);
-                }
-                let (send, recv) = mesh::channel();
-                config.vmbus_devices.push((
-                    DeviceVtl::Vtl0,
-                    ScsiControllerHandle {
-                        instance_id: guid::guid!("ba6163d9-04a1-4d29-b605-72e2ffb1dc7f"),
-                        max_sub_channel_count: 0,
-                        devices,
-                        io_queue_depth: None,
-                        requests: Some(recv),
-                        poll_mode_queue_depth: None,
-                    }
-                    .into_resource(),
-                ));
-                scsi_rpc = Some(send);
+            for disk in devices_config.scsi_disks {
+                let controller: usize = disk
+                    .controller
+                    .try_into()
+                    .ok()
+                    .context("SCSI controller value out of range")?;
+                let devices = controller_devices
+                    .get_mut(controller)
+                    .context("SCSI controller must be in the range 0..4")?;
+                devices.push(make_disk_config(disk).await?);
             }
 
             for nic in devices_config.nic_config {
@@ -1043,6 +1098,27 @@ impl VmService {
                     }
                 }
             }
+        }
+
+        let mut scsi_rpc = Vec::with_capacity(controller_devices.len());
+        for (instance_id, devices) in lcow_scsi_controller_ids()
+            .into_iter()
+            .zip(controller_devices)
+        {
+            let (send, recv) = mesh::channel();
+            config.vmbus_devices.push((
+                DeviceVtl::Vtl0,
+                ScsiControllerHandle {
+                    instance_id,
+                    max_sub_channel_count: 0,
+                    devices,
+                    io_queue_depth: None,
+                    requests: Some(recv),
+                    poll_mode_queue_depth: None,
+                }
+                .into_resource(),
+            ));
+            scsi_rpc.push(send);
         }
 
         if let Some(hvsocket_config) = req_config.hvsocket_config {
@@ -1117,6 +1193,8 @@ impl VmService {
             scsi_rpc,
             consomme_rpc,
             worker_rpc: send,
+            shutdown_ic: hyperv_ic.shutdown_ic,
+            kvp_ic: hyperv_ic.kvp_ic,
         }));
         self.lifecycle = VmLifecycle::Paused;
         Ok(())
@@ -1129,6 +1207,7 @@ impl VmService {
         // running, which in turn stops the VM worker from ever finishing its
         // stop, so waiting for the controller first would hang forever. The
         // REPL's quit path works around the same bug.
+        self.cancel_rpc_tasks().await;
         self.vm.take();
         controller.send(VmControllerRpc::Quit);
         drop(controller);
@@ -1304,10 +1383,11 @@ impl VmService {
                 };
 
                 if request.r#type == vmservice::ModifyType::Add as i32 {
-                    if disk.controller != 0 {
-                        anyhow::bail!("controller must be 0");
-                    }
-                    let scsi_rpc = vm.scsi_rpc.as_ref().context("no scsi controller")?.clone();
+                    let scsi_rpc = vm
+                        .scsi_rpc
+                        .get(disk.controller as usize)
+                        .context("no SCSI controller at requested index")?
+                        .clone();
                     Ok(async move {
                         let config = make_disk_config(disk).await?;
                         scsi_rpc
@@ -1319,8 +1399,8 @@ impl VmService {
                 } else if request.r#type == vmservice::ModifyType::Remove as i32 {
                     let recv = vm
                         .scsi_rpc
-                        .as_ref()
-                        .context("no scsi controller")?
+                        .get(disk.controller as usize)
+                        .context("no SCSI controller at requested index")?
                         .call_failable(ScsiControllerRequest::RemoveDevice, scsi_path);
                     Ok(async move { recv.await.map_err(anyhow::Error::from) }.boxed())
                 } else {
@@ -1338,8 +1418,11 @@ impl VmService {
                              configure it at VM creation time"
                         );
                     }
-                    let config = parse_nic_config(nic, None, &self.registry)?;
-                    let recv = vm.worker_rpc.call_failable(VmRpc::AddVmbusDevice, config);
+                    let instance_id = nic.nic_id.parse().context("invalid instance ID")?;
+                    let (vtl, resource) = parse_nic_config(nic, None, &self.registry)?;
+                    let recv = vm
+                        .worker_rpc
+                        .call_failable(VmRpc::AddVmbusDevice, (instance_id, vtl, resource));
                     Ok(async move { recv.await.map_err(anyhow::Error::from) }.boxed())
                 } else if request.r#type == vmservice::ModifyType::Update as i32 {
                     let consomme = match nic.backend.context("missing backend")? {
@@ -1363,6 +1446,14 @@ impl VmService {
                     }
                     .boxed())
                 } else if request.r#type == vmservice::ModifyType::Remove as i32 {
+                    #[cfg(windows)]
+                    if matches!(nic.backend, Some(vmservice::nic_config::Backend::Dio(_))) {
+                        let instance_id = parse_dio_remove_nic_id(&nic)?;
+                        let recv = vm
+                            .worker_rpc
+                            .call_failable(VmRpc::RemoveVmbusDevice, instance_id);
+                        return Ok(async move { recv.await.map_err(anyhow::Error::from) }.boxed());
+                    }
                     let consomme = match nic.backend.context("missing backend")? {
                         vmservice::nic_config::Backend::Consomme(c) => c,
                         _ => anyhow::bail!("port remove only supported for consomme backend"),
@@ -1489,6 +1580,14 @@ fn parse_nic_config(
         max_queues: None,
     };
     Ok((DeviceVtl::Vtl0, cfg.into_resource()))
+}
+
+#[cfg(windows)]
+fn parse_dio_remove_nic_id(nic: &vmservice::NicConfig) -> anyhow::Result<Guid> {
+    if !matches!(nic.backend, Some(vmservice::nic_config::Backend::Dio(_))) {
+        anyhow::bail!("DIO remove requires a DIO backend");
+    }
+    nic.nic_id.parse().context("invalid instance ID")
 }
 
 async fn make_disk_config(disk: vmservice::ScsiDisk) -> anyhow::Result<ScsiDeviceAndPath> {
@@ -2088,6 +2187,46 @@ fn build_vhost_user_device(
     _vhost_user: vmservice::VhostUser,
 ) -> anyhow::Result<Resource<VirtioDeviceHandle>> {
     anyhow::bail!("vhost-user is only supported on unix hosts")
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    fn dio_nic(nic_id: &str) -> vmservice::NicConfig {
+        vmservice::NicConfig {
+            nic_id: nic_id.to_owned(),
+            backend: Some(vmservice::nic_config::Backend::Dio(vmservice::DioBackend {
+                switch_id: "33333333-3333-3333-3333-333333333333".to_owned(),
+                port_id: "44444444-4444-4444-4444-444444444444".to_owned(),
+            })),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn parse_dio_remove_uses_existing_nic_id() {
+        let nic_id = "11111111-1111-1111-1111-111111111111";
+        assert_eq!(
+            parse_dio_remove_nic_id(&dio_nic(nic_id)).unwrap(),
+            nic_id.parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_dio_remove_rejects_invalid_identity_and_backend() {
+        assert!(parse_dio_remove_nic_id(&dio_nic("not-a-guid")).is_err());
+        assert!(
+            parse_dio_remove_nic_id(&vmservice::NicConfig {
+                nic_id: "11111111-1111-1111-1111-111111111111".to_owned(),
+                backend: Some(vmservice::nic_config::Backend::Consomme(
+                    vmservice::ConsommeBackend::default(),
+                )),
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
