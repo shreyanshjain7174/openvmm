@@ -712,6 +712,7 @@ message WindowsPCIDevice {
 message VirtioFSConfig {
     string tag = 1;
     string root_path = 2;
+    bool read_only = 3;
 }
 
 message VirtioConsoleConfig {

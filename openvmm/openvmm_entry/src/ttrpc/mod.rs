@@ -1052,14 +1052,7 @@ impl VmService {
             }
 
             for virtiofs in devices_config.virtiofs_config {
-                let resource = virtio_resources::fs::VirtioFsHandle {
-                    tag: virtiofs.tag,
-                    fs: virtio_resources::fs::VirtioFsBackend::HostFs {
-                        root_path: virtiofs.root_path,
-                        mount_options: String::new(),
-                    },
-                }
-                .into_resource();
+                let resource = build_virtiofs_config(virtiofs).into_resource();
                 // Use VPCI when possible (currently only on Windows and macOS due
                 // to KVM backend limitations).
                 if cfg!(windows) || cfg!(target_os = "macos") {
@@ -1500,6 +1493,23 @@ fn open_socket_backend(
         (connect_serial, "connect to")
     } else {
         (bind_serial, "bind")
+    }
+}
+
+fn build_virtiofs_config(
+    config: vmservice::VirtioFsConfig,
+) -> virtio_resources::fs::VirtioFsHandle {
+    let vmservice::VirtioFsConfig {
+        tag,
+        root_path,
+        read_only,
+    } = config;
+    virtio_resources::fs::VirtioFsHandle {
+        tag,
+        fs: virtio_resources::fs::VirtioFsBackend::HostFs {
+            root_path,
+            mount_options: if read_only { "ro" } else { "" }.to_owned(),
+        },
     }
 }
 
@@ -2187,6 +2197,35 @@ fn build_vhost_user_device(
     _vhost_user: vmservice::VhostUser,
 ) -> anyhow::Result<Resource<VirtioDeviceHandle>> {
     anyhow::bail!("vhost-user is only supported on unix hosts")
+}
+
+#[cfg(test)]
+mod virtiofs_tests {
+    use super::*;
+    use lxutil::LxVolumeOptions;
+
+    fn mount_options(read_only: bool) -> String {
+        let handle = build_virtiofs_config(vmservice::VirtioFsConfig {
+            tag: "share".to_owned(),
+            root_path: "host/path".to_owned(),
+            read_only,
+        });
+
+        match handle.fs {
+            virtio_resources::fs::VirtioFsBackend::HostFs { mount_options, .. } => mount_options,
+            _ => panic!("vmservice VirtioFSConfig must use the HostFs backend"),
+        }
+    }
+
+    #[test]
+    fn virtiofs_read_only_maps_to_lxvolume_mount_options() {
+        let read_only = mount_options(true);
+        assert!(LxVolumeOptions::from_option_string(&read_only).is_readonly());
+
+        let writable = mount_options(false);
+        assert_eq!(writable, "");
+        assert!(!LxVolumeOptions::from_option_string(&writable).is_readonly());
+    }
 }
 
 #[cfg(all(test, windows))]

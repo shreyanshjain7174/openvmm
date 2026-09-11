@@ -121,6 +121,7 @@ features = [
 build_rs_guest_arch.workspace = true
 
 [dev-dependencies]
+lxutil.workspace = true
 test_with_tracing.workspace = true
 
 [lints]
