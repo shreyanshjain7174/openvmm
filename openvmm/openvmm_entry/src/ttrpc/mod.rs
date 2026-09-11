@@ -1052,7 +1052,7 @@ impl VmService {
             }
 
             for virtiofs in devices_config.virtiofs_config {
-                let resource = build_virtiofs_config(virtiofs).into_resource();
+                let resource = build_virtiofs_handle(virtiofs).into_resource();
                 // Use VPCI when possible (currently only on Windows and macOS due
                 // to KVM backend limitations).
                 if cfg!(windows) || cfg!(target_os = "macos") {
@@ -1496,7 +1496,7 @@ fn open_socket_backend(
     }
 }
 
-fn build_virtiofs_config(
+fn build_virtiofs_handle(
     config: vmservice::VirtioFsConfig,
 ) -> virtio_resources::fs::VirtioFsHandle {
     let vmservice::VirtioFsConfig {
@@ -1508,7 +1508,11 @@ fn build_virtiofs_config(
         tag,
         fs: virtio_resources::fs::VirtioFsBackend::HostFs {
             root_path,
-            mount_options: if read_only { "ro" } else { "" }.to_owned(),
+            mount_options: if read_only {
+                "ro".to_owned()
+            } else {
+                String::new()
+            },
         },
     }
 }
@@ -2202,10 +2206,10 @@ fn build_vhost_user_device(
 #[cfg(test)]
 mod virtiofs_tests {
     use super::*;
-    use lxutil::LxVolumeOptions;
+    use test_with_tracing::test;
 
-    fn mount_options(read_only: bool) -> String {
-        let handle = build_virtiofs_config(vmservice::VirtioFsConfig {
+    fn host_fs_mount_options(read_only: bool) -> String {
+        let handle = build_virtiofs_handle(vmservice::VirtioFsConfig {
             tag: "share".to_owned(),
             root_path: "host/path".to_owned(),
             read_only,
@@ -2218,13 +2222,9 @@ mod virtiofs_tests {
     }
 
     #[test]
-    fn virtiofs_read_only_maps_to_lxvolume_mount_options() {
-        let read_only = mount_options(true);
-        assert!(LxVolumeOptions::from_option_string(&read_only).is_readonly());
-
-        let writable = mount_options(false);
-        assert_eq!(writable, "");
-        assert!(!LxVolumeOptions::from_option_string(&writable).is_readonly());
+    fn virtiofs_read_only_maps_to_canonical_mount_option() {
+        assert_eq!(host_fs_mount_options(true), "ro");
+        assert_eq!(host_fs_mount_options(false), "");
     }
 }
 

@@ -5852,7 +5852,6 @@ dependencies = [
  "input_core",
  "inspect",
  "inspect_proto",
- "lxutil",
  "memory_range",
  "mesh",
  "mesh_process",

@@ -712,6 +712,8 @@ message WindowsPCIDevice {
 message VirtioFSConfig {
     string tag = 1;
     string root_path = 2;
+    // Defaults to false (writable). Servers predating this field ignore it, so
+    // clients requiring read-only enforcement must use a compatible server.
     bool read_only = 3;
 }
 

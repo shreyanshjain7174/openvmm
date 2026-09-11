@@ -7,6 +7,7 @@
 //! directory, then drive FUSE requests through the descriptor ring just
 //! as a guest kernel would.
 
+use crate::LxVolumeOptions;
 use crate::VirtioFs;
 use crate::virtio::VirtioFsDevice;
 use fuse::protocol::*;
@@ -63,13 +64,17 @@ struct TestHarness {
 
 impl TestHarness {
     fn new(driver: &DefaultDriver) -> Self {
+        Self::new_with_options(driver, None)
+    }
+
+    fn new_with_options(driver: &DefaultDriver, mount_options: Option<&LxVolumeOptions>) -> Self {
         let tmpdir = tempfile::tempdir().unwrap();
 
         let mem = GuestMemory::allocate(TOTAL_MEM_SIZE);
         init_avail_ring(&mem, AVAIL_ADDR);
         init_used_ring(&mem, USED_ADDR);
 
-        let fs = VirtioFs::new(tmpdir.path(), None).unwrap();
+        let fs = VirtioFs::new(tmpdir.path(), mount_options).unwrap();
         let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
         let device = VirtioFsDevice::new(&driver_source, "testfs", fs, 0, None);
 
@@ -303,6 +308,27 @@ impl TestHarness {
         assert_eq!(init_out.major, FUSE_KERNEL_VERSION);
     }
 
+    async fn mkdir_root(&mut self, head_desc: u16, name: &str) -> fuse_out_header {
+        let mkdir_args = fuse_mkdir_in {
+            mode: 0o755,
+            umask: 0,
+        };
+        let mut args = mkdir_args.as_bytes().to_vec();
+        args.extend_from_slice(name.as_bytes());
+        args.push(0);
+
+        let resp_size = OUT_HEADER_SIZE + size_of::<fuse_entry_out>() as u32;
+        let (unique, resp_gpa) =
+            self.post_fuse_request(head_desc, FUSE_MKDIR, FUSE_ROOT_ID, &args, resp_size);
+
+        let (_used_id, used_len) = self.wait_for_used().await;
+        assert!(used_len > 0, "FUSE_MKDIR response should not be empty");
+
+        let out_header = self.read_out_header(resp_gpa);
+        assert_eq!(out_header.unique, unique);
+        out_header
+    }
+
     /// Return the path to the temp directory backing the filesystem.
     fn tmpdir_path(&self) -> &std::path::Path {
         self._tmpdir.path()
@@ -355,6 +381,32 @@ async fn getattr_root_returns_directory(driver: DefaultDriver) {
         0o040000,
         "root inode should be a directory"
     );
+}
+
+#[async_test]
+async fn direct_read_only_mount_options_reject_mkdir(driver: DefaultDriver) {
+    let options = LxVolumeOptions::from_option_string("ro");
+    assert!(options.is_readonly());
+    let mut harness = TestHarness::new_with_options(&driver, Some(&options));
+    harness.enable().await;
+    harness.fuse_init(0).await;
+
+    let out_header = harness.mkdir_root(2, "guest-write").await;
+    assert_eq!(out_header.error, -lx::Error::EROFS.value());
+    assert!(!harness.tmpdir_path().join("guest-write").exists());
+}
+
+#[async_test]
+async fn direct_empty_mount_options_permit_mkdir(driver: DefaultDriver) {
+    let options = LxVolumeOptions::from_option_string("");
+    assert!(!options.is_readonly());
+    let mut harness = TestHarness::new_with_options(&driver, Some(&options));
+    harness.enable().await;
+    harness.fuse_init(0).await;
+
+    let out_header = harness.mkdir_root(2, "guest-write").await;
+    assert_eq!(out_header.error, 0);
+    assert!(harness.tmpdir_path().join("guest-write").is_dir());
 }
 
 /// FUSE_FORGET is a no-reply operation — the descriptor should still be
