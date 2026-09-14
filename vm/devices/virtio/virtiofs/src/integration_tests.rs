@@ -67,6 +67,7 @@ impl TestHarness {
         Self::new_with_options(driver, None)
     }
 
+    /// Creates a test device whose host filesystem uses the supplied mount options.
     fn new_with_options(driver: &DefaultDriver, mount_options: Option<&LxVolumeOptions>) -> Self {
         let tmpdir = tempfile::tempdir().unwrap();
 
@@ -308,6 +309,7 @@ impl TestHarness {
         assert_eq!(init_out.major, FUSE_KERNEL_VERSION);
     }
 
+    /// Sends FUSE_MKDIR for a child of the root inode and returns its response header.
     async fn mkdir_root(&mut self, head_desc: u16, name: &str) -> fuse_out_header {
         let mkdir_args = fuse_mkdir_in {
             mode: 0o755,
@@ -383,6 +385,7 @@ async fn getattr_root_returns_directory(driver: DefaultDriver) {
     );
 }
 
+/// A host filesystem configured with `ro` rejects mutating FUSE requests.
 #[async_test]
 async fn direct_read_only_mount_options_reject_mkdir(driver: DefaultDriver) {
     let options = LxVolumeOptions::from_option_string("ro");
@@ -396,6 +399,7 @@ async fn direct_read_only_mount_options_reject_mkdir(driver: DefaultDriver) {
     assert!(!harness.tmpdir_path().join("guest-write").exists());
 }
 
+/// Empty host mount options retain the default writable behavior.
 #[async_test]
 async fn direct_empty_mount_options_permit_mkdir(driver: DefaultDriver) {
     let options = LxVolumeOptions::from_option_string("");

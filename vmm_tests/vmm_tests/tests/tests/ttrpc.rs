@@ -153,9 +153,14 @@ fn test_ttrpc_interface(
             let console_path = tempdir.path().join(format!("console-{i}.sock"));
             let virtiofs_root = tempdir.path().join(format!("virtiofs-{i}"));
             std::fs::create_dir_all(&virtiofs_root)?;
-            let readonly_virtiofs_root = tempdir.path().join(format!("virtiofs-readonly-{i}"));
-            std::fs::create_dir_all(&readonly_virtiofs_root)?;
-            std::fs::write(readonly_virtiofs_root.join("sentinel"), "host sentinel")?;
+            let readonly_virtiofs_root = if i == 0 {
+                let root = tempdir.path().join("virtiofs-readonly-0");
+                std::fs::create_dir_all(&root)?;
+                std::fs::write(root.join("sentinel"), "host sentinel")?;
+                Some(root)
+            } else {
+                None
+            };
             let hvsocket_path = tempdir.path().join(format!("hvsocket-{i}"));
             let pipette_listener = if i == 0 {
                 let path = format!(
@@ -344,6 +349,19 @@ fn test_ttrpc_interface(
                 )
             };
 
+            let mut virtiofs_config = vec![vmservice::VirtioFsConfig {
+                tag: "testfs".to_string(),
+                root_path: virtiofs_root.to_string_lossy().into(),
+                read_only: false,
+            }];
+            if let Some(root) = &readonly_virtiofs_root {
+                virtiofs_config.push(vmservice::VirtioFsConfig {
+                    tag: "readonly-testfs".to_string(),
+                    root_path: root.to_string_lossy().into(),
+                    read_only: true,
+                });
+            }
+
             client
                 .call()
                 .start(
@@ -384,18 +402,7 @@ fn test_ttrpc_interface(
                                     socket_path: console_path.to_string_lossy().into(),
                                     connect: use_connect,
                                 }),
-                                virtiofs_config: vec![
-                                    vmservice::VirtioFsConfig {
-                                        tag: "testfs".to_string(),
-                                        root_path: virtiofs_root.to_string_lossy().into(),
-                                        read_only: false,
-                                    },
-                                    vmservice::VirtioFsConfig {
-                                        tag: "readonly-testfs".to_string(),
-                                        root_path: readonly_virtiofs_root.to_string_lossy().into(),
-                                        read_only: true,
-                                    },
-                                ],
+                                virtiofs_config,
                                 // A SCSI controller keeps a request channel
                                 // alive for the lifetime of the VM, which used
                                 // to stop the VM worker from ever finishing its
@@ -1094,38 +1101,44 @@ fn file_disk(path: &Path) -> vmservice::DiskBackend {
     }
 }
 
+/// Verifies writable and host-enforced read-only VirtioFS shares from the guest.
 async fn validate_virtiofs_config(agent: &pipette_client::PipetteClient) -> anyhow::Result<()> {
-    let sh = agent.unix_shell();
     let writable_mount = "/mnt/testfs";
     let readonly_mount = "/mnt/readonly-testfs";
-    cmd!(sh, "mkdir -p {writable_mount} {readonly_mount}")
-        .run()
+    agent
+        .mount("testfs", writable_mount, "virtiofs", 0, true)
         .await?;
-    // Pass no guest mount options (flags 0); read-only enforcement must come
-    // from the host-side VirtioFS configuration.
-    cmd!(sh, "mount -t virtiofs testfs {writable_mount}")
-        .run()
-        .await?;
-    cmd!(sh, "mount -t virtiofs readonly-testfs {readonly_mount}")
-        .run()
+    agent
+        .mount("readonly-testfs", readonly_mount, "virtiofs", 0, true)
         .await?;
 
-    let sentinel = cmd!(sh, "cat {readonly_mount}/sentinel").read().await?;
-    anyhow::ensure!(sentinel == "host sentinel", "read-only sentinel mismatch");
+    let sentinel = agent
+        .read_file(format!("{readonly_mount}/sentinel"))
+        .await?;
+    anyhow::ensure!(sentinel == b"host sentinel", "read-only sentinel mismatch");
 
-    cmd!(sh, "touch {writable_mount}/guest-write").run().await?;
-    let readonly_write = cmd!(sh, "touch {readonly_mount}/guest-write")
-        .ignore_status()
-        .output()
+    let contents = b"guest write";
+    let writable_path = format!("{writable_mount}/guest-write");
+    agent
+        .write_file(&writable_path, contents.as_slice())
         .await?;
     anyhow::ensure!(
-        !readonly_write.status.success(),
-        "write unexpectedly succeeded on read-only VirtioFS share"
+        agent.read_file(&writable_path).await? == contents,
+        "writable VirtioFS contents mismatch"
     );
+
+    let readonly_error = agent
+        .write_file(format!("{readonly_mount}/guest-write"), contents.as_slice())
+        .await
+        .expect_err("write unexpectedly succeeded on read-only VirtioFS share");
+    // RemoteError preserves the guest error chain as strings but erases its
+    // concrete io::Error type, so validate the Linux EROFS errno numerically.
+    const EROFS: i32 = 30;
     anyhow::ensure!(
-        String::from_utf8_lossy(&readonly_write.stderr).contains("Read-only file system"),
-        "read-only VirtioFS write did not fail with EROFS: {}",
-        String::from_utf8_lossy(&readonly_write.stderr)
+        readonly_error
+            .chain()
+            .any(|cause| cause.to_string().ends_with(&format!("(os error {EROFS})"))),
+        "read-only VirtioFS write did not fail with EROFS (errno {EROFS}): {readonly_error:#}"
     );
 
     Ok(())
