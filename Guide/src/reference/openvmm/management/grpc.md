@@ -19,6 +19,26 @@ For example, to accept ttrpc clients only:
 --rpc path=/path/to/openvmm.sock,transport=ttrpc
 ```
 
+## VirtioFS configuration
+
+`DevicesConfig.virtiofs_config` defines VirtioFS shares when the VM is
+created. Each `VirtioFSConfig` supplies a tag and host root path. The
+additive proto3 field `read_only` is field 3. Its absent or `false` value
+keeps the default writable behavior. A value of `true` selects the
+canonical `ro` host mount option, so the host backend enforces read-only
+access.
+
+```admonish warning title="Protocol compatibility"
+A server generated from an older schema ignores the unknown `read_only`
+field and therefore treats the share as writable. Keep the protocol
+bindings and server version compatible when requesting read-only access.
+```
+
+Create-time VirtioFS configuration is distinct from adding or removing a
+directory share while a VM is running. Supporting a share at VM creation
+does not imply that a runtime `ModifyResource` path maps dynamic shares to
+VirtioFS.
+
 Here is a list of supported RPCs:
 
 ```admonish danger title="Disclaimer"

@@ -132,6 +132,14 @@ impl<T: 'static + VmbusDevice> ChannelUnit<T> {
     }
 }
 
+impl ChannelUnit<dyn VmbusDevice> {
+    /// Revokes a dynamically offered channel, returning `None` when the VMBus
+    /// server has already gone away.
+    pub async fn revoke_optional(self) -> Option<Box<dyn VmbusDevice>> {
+        self.0.revoke().await
+    }
+}
+
 impl<T: 'static + VmbusDevice + ?Sized> StateUnit for &'_ ChannelUnit<T> {
     async fn start(&mut self) {
         self.0.start();

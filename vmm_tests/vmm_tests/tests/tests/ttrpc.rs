@@ -153,6 +153,14 @@ fn test_ttrpc_interface(
             let console_path = tempdir.path().join(format!("console-{i}.sock"));
             let virtiofs_root = tempdir.path().join(format!("virtiofs-{i}"));
             std::fs::create_dir_all(&virtiofs_root)?;
+            let readonly_virtiofs_root = if i == 0 {
+                let root = tempdir.path().join("virtiofs-readonly-0");
+                std::fs::create_dir_all(&root)?;
+                std::fs::write(root.join("sentinel"), "host sentinel")?;
+                Some(root)
+            } else {
+                None
+            };
             let hvsocket_path = tempdir.path().join(format!("hvsocket-{i}"));
             let pipette_listener = if i == 0 {
                 let path = format!(
@@ -341,6 +349,19 @@ fn test_ttrpc_interface(
                 )
             };
 
+            let mut virtiofs_config = vec![vmservice::VirtioFsConfig {
+                tag: "testfs".to_string(),
+                root_path: virtiofs_root.to_string_lossy().into(),
+                read_only: false,
+            }];
+            if let Some(root) = &readonly_virtiofs_root {
+                virtiofs_config.push(vmservice::VirtioFsConfig {
+                    tag: "readonly-testfs".to_string(),
+                    root_path: root.to_string_lossy().into(),
+                    read_only: true,
+                });
+            }
+
             client
                 .call()
                 .start(
@@ -381,10 +402,7 @@ fn test_ttrpc_interface(
                                     socket_path: console_path.to_string_lossy().into(),
                                     connect: use_connect,
                                 }),
-                                virtiofs_config: vec![vmservice::VirtioFsConfig {
-                                    tag: "testfs".to_string(),
-                                    root_path: virtiofs_root.to_string_lossy().into(),
-                                }],
+                                virtiofs_config,
                                 // A SCSI controller keeps a request channel
                                 // alive for the lifetime of the VM, which used
                                 // to stop the VM worker from ever finishing its
@@ -562,6 +580,7 @@ fn test_ttrpc_interface(
                         )
                         .await?;
                         validate_pcie_config(&agent).await?;
+                        validate_virtiofs_config(&agent).await?;
                         agent.power_off().await?;
                     }
 
@@ -1080,6 +1099,49 @@ fn file_disk(path: &Path) -> vmservice::DiskBackend {
             direct: false,
         })),
     }
+}
+
+/// Verifies writable and host-enforced read-only VirtioFS shares from the guest.
+async fn validate_virtiofs_config(agent: &pipette_client::PipetteClient) -> anyhow::Result<()> {
+    let writable_mount = "/mnt/testfs";
+    let readonly_mount = "/mnt/readonly-testfs";
+    agent
+        .mount("testfs", writable_mount, "virtiofs", 0, true)
+        .await?;
+    agent
+        .mount("readonly-testfs", readonly_mount, "virtiofs", 0, true)
+        .await?;
+
+    let sentinel = agent
+        .read_file(format!("{readonly_mount}/sentinel"))
+        .await?;
+    anyhow::ensure!(sentinel == b"host sentinel", "read-only sentinel mismatch");
+
+    let contents = b"guest write";
+    let writable_path = format!("{writable_mount}/guest-write");
+    agent
+        .write_file(&writable_path, contents.as_slice())
+        .await?;
+    anyhow::ensure!(
+        agent.read_file(&writable_path).await? == contents,
+        "writable VirtioFS contents mismatch"
+    );
+
+    let readonly_error = agent
+        .write_file(format!("{readonly_mount}/guest-write"), contents.as_slice())
+        .await
+        .expect_err("write unexpectedly succeeded on read-only VirtioFS share");
+    // RemoteError preserves the guest error chain as strings but erases its
+    // concrete io::Error type, so validate the Linux EROFS errno numerically.
+    const EROFS: i32 = 30;
+    anyhow::ensure!(
+        readonly_error
+            .chain()
+            .any(|cause| cause.to_string().ends_with(&format!("(os error {EROFS})"))),
+        "read-only VirtioFS write did not fail with EROFS (errno {EROFS}): {readonly_error:#}"
+    );
+
+    Ok(())
 }
 
 async fn validate_pcie_config(agent: &pipette_client::PipetteClient) -> anyhow::Result<()> {

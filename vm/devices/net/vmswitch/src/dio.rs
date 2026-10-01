@@ -25,10 +25,11 @@ use std::ptr;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
+use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
 use windows_sys::Win32::Foundation::STATUS_SUCCESS;
 use windows_sys::Win32::Storage::FileSystem::ReadFile;
 use windows_sys::Win32::Storage::FileSystem::WriteFile;
-use windows_sys::Win32::System::IO::CancelIo;
+use windows_sys::Win32::System::IO::CancelIoEx;
 use windows_sys::Win32::System::Threading::INFINITE;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 use zerocopy::FromBytes;
@@ -314,9 +315,19 @@ impl Write for DioQueue {
 impl Drop for QueueState {
     fn drop(&mut self) {
         // Cancel and wait on any outstanding IO to release the overlapped
-        // structures and buffers.
+        // structures and buffers. Reads may have been issued by another
+        // thread, so cancel IO from all threads.
         unsafe {
-            CancelIo(self.handle.0);
+            // ERROR_NOT_FOUND just means nothing was pending.
+            if CancelIoEx(self.handle.0, ptr::null()) == 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() != Some(ERROR_NOT_FOUND as i32) {
+                    tracing::warn!(
+                        error = &err as &dyn std::error::Error,
+                        "failed to cancel DIO IO"
+                    );
+                }
+            }
         }
         for o in self.in_overlapped.iter() {
             while o.io_status().is_none() {
@@ -350,12 +361,27 @@ mod tests {
     use pal_async::DefaultDriver;
     use pal_async::async_test;
     use pal_async::driver::Driver;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use std::time::Instant;
 
-    const MAC_ADDRESS: [u8; 6] = [0x00, 0x15, 0x5D, 0x18, 0x99, 0x25];
+    /// A random locally administered unicast MAC, so tests never collide.
+    fn random_mac() -> [u8; 6] {
+        let mut mac = [0; 6];
+        getrandom::fill(&mut mac).unwrap();
+        mac[0] = (mac[0] & 0xfe) | 0x02;
+        mac
+    }
 
     fn connected_nic(driver: &impl Driver) -> (DioQueue, SwitchPort) {
+        connected_nic_with_mac(driver, random_mac())
+    }
+
+    fn connected_nic_with_mac(driver: &impl Driver, mac: [u8; 6]) -> (DioQueue, SwitchPort) {
         let vm_id = Guid::new_random();
-        let mut e = DioNic::new(vm_id, "nic", "my nic", MAC_ADDRESS).unwrap();
+        let mut e = DioNic::new(vm_id, "nic", "my nic", mac).unwrap();
         // Connect to the Default Switch by well-known GUID.
         let id = SwitchPortId {
             switch: crate::hcn::DEFAULT_SWITCH,
@@ -373,5 +399,107 @@ mod tests {
         let (mut e, _port) = connected_nic(&driver);
         let mut packet = [0; FRAME_SIZE];
         assert!(e.read(&mut packet).now_or_never().is_none());
+    }
+
+    /// Runs `f` on a new thread and returns its result, or `None` if it did not
+    /// finish within `limit` (the thread is leaked in that case).
+    fn run_bounded<R: Send + 'static>(
+        limit: Duration,
+        f: impl FnOnce() -> R + Send + 'static,
+    ) -> Option<R> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(limit).ok()
+    }
+
+    const DROP_LIMIT: Duration = Duration::from_secs(5);
+
+    /// Dropping a queue on the thread that created it cancels the initial
+    /// reads promptly.
+    #[async_test]
+    #[ignore] // Requires vmswitch and admin privileges
+    async fn drop_on_creating_thread_is_prompt(driver: DefaultDriver) {
+        let elapsed = run_bounded(DROP_LIMIT, move || {
+            let (queue, _port) = connected_nic(&driver);
+            let start = Instant::now();
+            drop(queue);
+            start.elapsed()
+        })
+        .expect("drop on the creating thread did not complete");
+        assert!(elapsed < Duration::from_secs(1), "took {elapsed:?}");
+    }
+
+    /// Dropping a queue on a thread other than the one that created it must
+    /// still cancel the outstanding reads.
+    #[async_test]
+    #[ignore] // Requires vmswitch and admin privileges
+    async fn drop_on_other_thread_is_prompt(driver: DefaultDriver) {
+        let (queue, _port) = connected_nic(&driver);
+        run_bounded(DROP_LIMIT, move || drop(queue))
+            .expect("drop on a different thread did not complete: reads were not cancelled");
+    }
+
+    /// A read re-issued after a frame is consumed on one thread must be
+    /// cancelled when the queue is dropped on another.
+    #[async_test]
+    #[ignore] // Requires vmswitch and admin privileges
+    async fn drop_after_frame_consumed_on_other_thread_is_prompt(driver: DefaultDriver) {
+        let sender_mac = random_mac();
+        let (mut sender, _sender_port) = connected_nic_with_mac(&driver, sender_mac);
+        // 0 = waiting for frame, 1 = frame consumed, 2 = drop started.
+        let stage = Arc::new(AtomicU32::new(0));
+        let stage2 = stage.clone();
+        let result = run_bounded(DROP_LIMIT * 3, move || {
+            let (queue, _port) = connected_nic(&driver);
+            sender.write_with(60, |buf| {
+                buf[..6].fill(0xff);
+                buf[6..12].copy_from_slice(&sender_mac);
+                buf[12..14].copy_from_slice(&[0x88, 0xb5]);
+                buf[14..].fill(0);
+            });
+            // Keep the consumer alive: Windows cancels a thread's pending IO when it exits.
+            let stage3 = stage2.clone();
+            let (queue_tx, queue_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let consumer = std::thread::spawn(move || {
+                let mut queue = queue;
+                let deadline = Instant::now() + DROP_LIMIT;
+                // Poll directly; the async test thread is blocked, so no event loop runs.
+                loop {
+                    match queue.read_with(|_| ()) {
+                        Ok(()) => break,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(e) => panic!("no frame consumed: {e}"),
+                    }
+                }
+                stage2.store(1, Ordering::SeqCst);
+                queue_tx.send(queue).unwrap();
+                let _ = release_rx.recv();
+            });
+            let queue = queue_rx
+                .recv()
+                .expect("consumer failed before consuming a frame");
+            let start = Instant::now();
+            stage3.store(2, Ordering::SeqCst);
+            drop(queue);
+            let elapsed = start.elapsed();
+            drop(release_tx);
+            consumer.join().unwrap();
+            (elapsed, sender)
+        });
+        let (elapsed, _sender) = result.unwrap_or_else(|| {
+            panic!(
+                "timed out at stage {} (2 = the drop hung)",
+                stage.load(Ordering::SeqCst)
+            )
+        });
+        assert!(elapsed < Duration::from_secs(1), "drop took {elapsed:?}");
     }
 }

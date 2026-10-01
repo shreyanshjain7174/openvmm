@@ -742,7 +742,10 @@ struct LoadedVmInner {
     processor_topology: ProcessorTopology,
     hypervisor_cfg: HypervisorConfig,
     vmbus_redirect: bool,
-    vmbus_devices: Vec<SpawnedUnit<ChannelUnit<dyn VmbusDevice>>>,
+    _vmbus_devices: Vec<SpawnedUnit<ChannelUnit<dyn VmbusDevice>>>,
+    dynamic_vmbus_devices:
+        std::collections::HashMap<guid::Guid, SpawnedUnit<ChannelUnit<dyn VmbusDevice>>>,
+    removed_dynamic_vmbus_devices: std::collections::HashSet<guid::Guid>,
 
     input_distributor: SpawnedUnit<InputDistributor>,
     vtl2_framebuffer_gpa_base: Option<u64>,
@@ -2994,7 +2997,9 @@ impl InitializedVm {
                 _vmbus_proxy: vmbus_proxy,
                 #[cfg(windows)]
                 _kernel_vmnics: kernel_vmnics,
-                vmbus_devices,
+                _vmbus_devices: vmbus_devices,
+                dynamic_vmbus_devices: std::collections::HashMap::new(),
+                removed_dynamic_vmbus_devices: std::collections::HashSet::new(),
                 chipset_cfg: cfg.chipset,
                 chipset_capabilities: cfg.chipset_capabilities,
                 firmware_event_send: cfg.firmware_event_send,
@@ -3609,7 +3614,17 @@ impl LoadedVm {
                         }
                     }),
                     VmRpc::AddVmbusDevice(rpc) => {
-                        rpc.handle_failable(async |(vtl, resource)| {
+                        rpc.handle_failable(async |(instance_id, vtl, resource)| {
+                            if self
+                                .inner
+                                .dynamic_vmbus_devices
+                                .contains_key(&instance_id)
+                            {
+                                anyhow::bail!(
+                                    "a dynamically added VMBus device already exists at instance ID {}",
+                                    instance_id
+                                );
+                            }
                             let vmbus = match vtl {
                                 DeviceVtl::Vtl0 => self.inner.vmbus_server.as_ref(),
                                 DeviceVtl::Vtl1 => None,
@@ -3624,8 +3639,41 @@ impl LoadedVm {
                                 resource,
                             )
                             .await?;
-                            self.inner.vmbus_devices.push(device);
+                            self.inner
+                                .dynamic_vmbus_devices
+                                .insert(instance_id, device);
+                            self.inner
+                                .removed_dynamic_vmbus_devices
+                                .remove(&instance_id);
                             self.state_units.start_stopped_units().await;
+                            anyhow::Ok(())
+                        })
+                        .await
+                    }
+                    VmRpc::RemoveVmbusDevice(rpc) => {
+                        rpc.handle_failable(async |instance_id| {
+                            let Some(device) = self
+                                .inner
+                                .dynamic_vmbus_devices
+                                .remove(&instance_id)
+                            else {
+                                if self
+                                    .inner
+                                    .removed_dynamic_vmbus_devices
+                                    .contains(&instance_id)
+                                {
+                                    return anyhow::Ok(());
+                                }
+                                anyhow::bail!(
+                                    "no dynamically added VMBus device exists at instance ID {}",
+                                    instance_id
+                                );
+                            };
+                            let channel = device.remove().await;
+                            let _ = channel.revoke_optional().await;
+                            self.inner
+                                .removed_dynamic_vmbus_devices
+                                .insert(instance_id);
                             anyhow::Ok(())
                         })
                         .await
