@@ -107,6 +107,18 @@ impl VirtioFs {
         root_path: impl AsRef<Path>,
         mount_options: Option<&LxVolumeOptions>,
     ) -> lx::Result<()> {
+        self.add_child_restricted(name, root_path, mount_options, Vec::new())
+    }
+
+    /// Like [`Self::add_child`], but only `allowed_names` are visible at the
+    /// child root when non-empty.
+    pub fn add_child_restricted(
+        &self,
+        name: &str,
+        root_path: impl AsRef<Path>,
+        mount_options: Option<&LxVolumeOptions>,
+        allowed_names: Vec<String>,
+    ) -> lx::Result<()> {
         let Some(aggregate) = self.inner.aggregate() else {
             return Err(lx::Error::EINVAL);
         };
@@ -132,7 +144,9 @@ impl VirtioFs {
         registry.next_volume_id = volume_id.checked_add(1).ok_or(lx::Error::ENOSPC)?;
         registry.entries.push(ChildEntry {
             name: name.to_string(),
-            volume: Arc::new(VirtioFsVolume::new(volume, volume_id, readonly)),
+            volume: Arc::new(
+                VirtioFsVolume::new(volume, volume_id, readonly).with_allowed_names(allowed_names),
+            ),
         });
         tracing::info!(
             name,

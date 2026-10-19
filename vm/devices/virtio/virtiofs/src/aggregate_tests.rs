@@ -6,6 +6,8 @@ use crate::VirtioFs;
 use crate::inode;
 use fuse::protocol::FUSE_ROOT_ID;
 use lxutil::LxVolumeOptions;
+use pal_async::async_test;
+use pal_async::task::Spawn;
 use std::sync::Arc;
 use test_with_tracing::test;
 
@@ -195,4 +197,60 @@ fn add_child_rejected_after_teardown() {
         fs.inner.aggregate().unwrap().registry.read().entries.len(),
         1
     );
+}
+
+#[async_test]
+async fn share_requests_add_and_remove_children(driver: pal_async::DefaultDriver) {
+    use mesh::rpc::RpcSend;
+    use virtio_resources::fs::VirtioFsAggregateChild;
+    use virtio_resources::fs::VirtioFsShareRequest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fs = VirtioFs::new_aggregate();
+    let (send, recv) = mesh::channel();
+    let task = driver.spawn(
+        "shares",
+        crate::resolver::handle_share_requests(fs.clone(), recv),
+    );
+
+    send.call_failable(
+        VirtioFsShareRequest::AddChild,
+        VirtioFsAggregateChild {
+            name: "0".into(),
+            root_path: dir.path().to_string_lossy().into_owned(),
+            mount_options: String::new(),
+            allowed_names: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        fs.lookup_synthetic_root(lx::LxStr::from_bytes(b"0"))
+            .is_ok()
+    );
+
+    let dup = send
+        .call_failable(
+            VirtioFsShareRequest::AddChild,
+            VirtioFsAggregateChild {
+                name: "0".into(),
+                root_path: dir.path().to_string_lossy().into_owned(),
+                mount_options: String::new(),
+                allowed_names: Vec::new(),
+            },
+        )
+        .await;
+    assert!(dup.is_err(), "duplicate child name must fail");
+
+    send.call_failable(VirtioFsShareRequest::RemoveChild, "0".to_string())
+        .await
+        .unwrap();
+    assert_eq!(
+        fs.lookup_synthetic_root(lx::LxStr::from_bytes(b"0"))
+            .unwrap_err(),
+        lx::Error::ENOENT
+    );
+
+    drop(send);
+    task.await;
 }

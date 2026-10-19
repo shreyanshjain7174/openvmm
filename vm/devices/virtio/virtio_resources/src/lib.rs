@@ -42,6 +42,7 @@ pub mod p9 {
 
 pub mod fs {
     use mesh::MeshPayload;
+    use mesh::rpc::FailableRpc;
     use vm_resource::ResourceId;
     use vm_resource::kind::VirtioDeviceHandle;
 
@@ -65,6 +66,8 @@ pub mod fs {
         /// PCI/MMIO footprint) serve many shares.
         Aggregate {
             children: Vec<VirtioFsAggregateChild>,
+            /// Runtime add and remove of children. `None` fixes the child set.
+            requests: Option<mesh::Receiver<VirtioFsShareRequest>>,
         },
     }
 
@@ -77,6 +80,15 @@ pub mod fs {
         pub name: String,
         pub root_path: String,
         pub mount_options: String,
+        /// When non-empty, only these names are visible at the child root.
+        pub allowed_names: Vec<String>,
+    }
+
+    /// Runtime changes to an aggregate device's children.
+    #[derive(MeshPayload)]
+    pub enum VirtioFsShareRequest {
+        AddChild(FailableRpc<VirtioFsAggregateChild, ()>),
+        RemoveChild(FailableRpc<String, ()>),
     }
 
     impl ResourceId<VirtioDeviceHandle> for VirtioFsHandle {

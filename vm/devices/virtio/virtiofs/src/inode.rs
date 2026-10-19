@@ -41,6 +41,7 @@ pub(crate) struct VirtioFsVolume {
     volume: Arc<LxVolume>,
     id: u32,
     readonly: bool,
+    allowed_names: Vec<String>,
 }
 
 impl VirtioFsVolume {
@@ -49,7 +50,13 @@ impl VirtioFsVolume {
             volume: Arc::new(volume),
             id,
             readonly,
+            allowed_names: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_allowed_names(mut self, allowed_names: Vec<String>) -> Self {
+        self.allowed_names = allowed_names;
+        self
     }
 
     pub(crate) fn id(&self) -> u32 {
