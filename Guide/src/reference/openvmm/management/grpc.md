@@ -34,10 +34,9 @@ field and therefore treats the share as writable. Keep the protocol
 bindings and server version compatible when requesting read-only access.
 ```
 
-Create-time VirtioFS configuration is distinct from adding or removing a
-directory share while a VM is running. Supporting a share at VM creation
-does not imply that a runtime `ModifyResource` path maps dynamic shares to
-VirtioFS.
+`DevicesConfig.virtiofs_aggregate` creates one virtio-fs device;
+`ModifyResource` with `virtiofs_share` adds or removes a named child.
+`allowed_names` limits a child root to those names.
 
 Here is a list of supported RPCs:
 

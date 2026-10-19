@@ -507,6 +507,7 @@ struct Vm {
     worker_rpc: mesh::Sender<VmRpc>,
     scsi_rpc: Vec<mesh::Sender<ScsiControllerRequest>>,
     consomme_rpc: Option<mesh::Sender<ConsommeRequest>>,
+    virtiofs_rpc: Option<mesh::Sender<virtio_resources::fs::VirtioFsShareRequest>>,
     #[expect(
         dead_code,
         reason = "keeps the shutdown IC receiver alive for the VM lifetime"
@@ -1016,6 +1017,7 @@ impl VmService {
         let mut controller_devices: [Vec<ScsiDeviceAndPath>; 4] =
             std::array::from_fn(|_| Vec::new());
         let mut consomme_rpc = None;
+        let mut virtiofs_rpc = None;
         let hyperv_ic = build_hyperv_ic_resources();
         config.vmbus_devices.extend(hyperv_ic.devices);
         if let Some(devices_config) = req_config.devices_config {
@@ -1053,18 +1055,25 @@ impl VmService {
 
             for virtiofs in devices_config.virtiofs_config {
                 let resource = build_virtiofs_handle(virtiofs).into_resource();
-                // Use VPCI when possible (currently only on Windows and macOS due
-                // to KVM backend limitations).
-                if cfg!(windows) || cfg!(target_os = "macos") {
-                    config.vpci_devices.push(VpciDeviceConfig {
-                        vtl: DeviceVtl::Vtl0,
-                        instance_id: Guid::new_random(),
-                        resource: VirtioPciDeviceHandle(resource).into_resource(),
-                        vnode: None,
-                    });
-                } else {
-                    config.virtio_devices.push((VirtioBus::Mmio, resource));
+                push_virtio_device(&mut config, resource);
+            }
+
+            if let Some(aggregate) = devices_config.virtiofs_aggregate {
+                anyhow::ensure!(
+                    !aggregate.tag.is_empty() && aggregate.tag.len() <= 36,
+                    "virtiofs aggregate tag must be 1-36 bytes"
+                );
+                let (send, recv) = mesh::channel();
+                let resource = virtio_resources::fs::VirtioFsHandle {
+                    tag: aggregate.tag,
+                    fs: virtio_resources::fs::VirtioFsBackend::Aggregate {
+                        children: Vec::new(),
+                        requests: Some(recv),
+                    },
                 }
+                .into_resource();
+                push_virtio_device(&mut config, resource);
+                virtiofs_rpc = Some(send);
             }
 
             if let Some(virtio_console) = devices_config.virtio_console {
@@ -1079,16 +1088,7 @@ impl VmService {
                         })?;
                     let resource: Resource<VirtioDeviceHandle> =
                         virtio_resources::console::VirtioConsoleHandle { backend }.into_resource();
-                    if cfg!(windows) || cfg!(target_os = "macos") {
-                        config.vpci_devices.push(VpciDeviceConfig {
-                            vtl: DeviceVtl::Vtl0,
-                            instance_id: Guid::new_random(),
-                            resource: VirtioPciDeviceHandle(resource).into_resource(),
-                            vnode: None,
-                        });
-                    } else {
-                        config.virtio_devices.push((VirtioBus::Mmio, resource));
-                    }
+                    push_virtio_device(&mut config, resource);
                 }
             }
         }
@@ -1185,6 +1185,7 @@ impl VmService {
         self.vm = Some(Arc::new(Vm {
             scsi_rpc,
             consomme_rpc,
+            virtiofs_rpc,
             worker_rpc: send,
             shutdown_ic: hyperv_ic.shutdown_ic,
             kvp_ic: hyperv_ic.kvp_ic,
@@ -1473,6 +1474,28 @@ impl VmService {
             }
             Resource::VpmemDisk(_) => anyhow::bail!("vpmem not supported"),
             Resource::WindowsDevice(_) => anyhow::bail!("device assignment not supported"),
+            Resource::VirtiofsShare(share) => {
+                let rpc = vm
+                    .virtiofs_rpc
+                    .as_ref()
+                    .context("VM has no virtiofs aggregate device")?
+                    .clone();
+                if request.r#type == vmservice::ModifyType::Add as i32 {
+                    let child = build_virtiofs_share_child(share)?;
+                    let recv = rpc
+                        .call_failable(virtio_resources::fs::VirtioFsShareRequest::AddChild, child);
+                    Ok(async move { recv.await.map_err(anyhow::Error::from) }.boxed())
+                } else if request.r#type == vmservice::ModifyType::Remove as i32 {
+                    anyhow::ensure!(!share.name.is_empty(), "virtiofs share name is empty");
+                    let recv = rpc.call_failable(
+                        virtio_resources::fs::VirtioFsShareRequest::RemoveChild,
+                        share.name,
+                    );
+                    Ok(async move { recv.await.map_err(anyhow::Error::from) }.boxed())
+                } else {
+                    anyhow::bail!("unsupported request type {}", request.r#type);
+                }
+            }
             Resource::Processor(_) | Resource::ProcessorConfig(_) | Resource::Memory(_) => {
                 anyhow::bail!("processor and memory resources not supported")
             }
@@ -1514,6 +1537,44 @@ fn build_virtiofs_handle(
                 String::new()
             },
         },
+    }
+}
+
+fn build_virtiofs_share_child(
+    share: vmservice::VirtioFsShare,
+) -> anyhow::Result<virtio_resources::fs::VirtioFsAggregateChild> {
+    let vmservice::VirtioFsShare {
+        name,
+        root_path,
+        read_only,
+        allowed_names,
+    } = share;
+    anyhow::ensure!(!name.is_empty(), "virtiofs share name is empty");
+    anyhow::ensure!(!root_path.is_empty(), "virtiofs share root_path is empty");
+    Ok(virtio_resources::fs::VirtioFsAggregateChild {
+        name,
+        root_path,
+        mount_options: if read_only {
+            "ro".to_owned()
+        } else {
+            String::new()
+        },
+        allowed_names,
+    })
+}
+
+/// Attaches a virtio device over VPCI where supported, otherwise over MMIO.
+fn push_virtio_device(config: &mut Config, resource: Resource<VirtioDeviceHandle>) {
+    // VPCI is only available on Windows and macOS due to KVM backend limitations.
+    if cfg!(windows) || cfg!(target_os = "macos") {
+        config.vpci_devices.push(VpciDeviceConfig {
+            vtl: DeviceVtl::Vtl0,
+            instance_id: Guid::new_random(),
+            resource: VirtioPciDeviceHandle(resource).into_resource(),
+            vnode: None,
+        });
+    } else {
+        config.virtio_devices.push((VirtioBus::Mmio, resource));
     }
 }
 
@@ -2225,6 +2286,36 @@ mod virtiofs_tests {
     fn virtiofs_read_only_maps_to_canonical_mount_option() {
         assert_eq!(host_fs_mount_options(true), "ro");
         assert_eq!(host_fs_mount_options(false), "");
+    }
+
+    #[test]
+    fn share_child_maps_read_only_and_allowed_names() {
+        let child = build_virtiofs_share_child(vmservice::VirtioFsShare {
+            name: "3".into(),
+            root_path: r"C:\data\".into(),
+            read_only: true,
+            allowed_names: vec!["config.json".into()],
+        })
+        .unwrap();
+        assert_eq!(child.name, "3");
+        assert_eq!(child.root_path, r"C:\data\");
+        assert_eq!(child.mount_options, "ro");
+        assert_eq!(child.allowed_names, vec!["config.json".to_string()]);
+    }
+
+    #[test]
+    fn share_child_rejects_empty_name_or_path() {
+        for (name, root) in [("", r"C:\data"), ("1", "")] {
+            assert!(
+                build_virtiofs_share_child(vmservice::VirtioFsShare {
+                    name: name.into(),
+                    root_path: root.into(),
+                    read_only: false,
+                    allowed_names: Vec::new(),
+                })
+                .is_err()
+            );
+        }
     }
 }
 

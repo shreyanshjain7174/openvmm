@@ -130,6 +130,8 @@ message DevicesConfig {
     repeated WindowsPCIDevice windows_device = 4;
     repeated VirtioFSConfig virtiofs_config = 5;
     VirtioConsoleConfig virtio_console = 6;
+    // One aggregate virtio-fs device whose children are added with ModifyResource.
+    VirtioFSAggregateConfig virtiofs_aggregate = 7;
 }
 
 // An endpoint PCIe device function. Attached behind a port in the topology
@@ -717,6 +719,21 @@ message VirtioFSConfig {
     bool read_only = 3;
 }
 
+message VirtioFSAggregateConfig {
+    // Guest-visible tag. Must be 36 bytes or fewer.
+    string tag = 1;
+}
+
+// A child share of the aggregate virtio-fs device.
+message VirtioFSShare {
+    string name = 1;
+    // Required for ADD, ignored for REMOVE.
+    string root_path = 2;
+    bool read_only = 3;
+    // When set, only these names are visible at the share root.
+    repeated string allowed_names = 4;
+}
+
 message VirtioConsoleConfig {
     // Path to a named pipe or Unix domain socket for the console backend.
     string socket_path = 1;
@@ -750,6 +767,7 @@ message ModifyResourceRequest {
         VPMEMDisk vpmem_disk = 6;
         NICConfig nic_config = 7;
         WindowsPCIDevice windows_device = 8;
+        VirtioFSShare virtiofs_share = 9;
     }
 }
 
