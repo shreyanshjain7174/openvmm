@@ -144,6 +144,26 @@ impl VirtioFsInode {
         self.volume.readonly()
     }
 
+    /// True when this inode is the root of a child limited to allowed names.
+    pub(crate) fn is_restricted_root(&self) -> bool {
+        !self.volume.allowed_names.is_empty() && self.get_path().as_os_str().is_empty()
+    }
+
+    /// Rejects names that are not allowed at a restricted child root.
+    pub(crate) fn check_allowed_child(&self, name: &LxStr) -> lx::Result<()> {
+        if !self.is_restricted_root()
+            || self
+                .volume
+                .allowed_names
+                .iter()
+                .any(|n| n.as_bytes() == name.as_bytes())
+        {
+            Ok(())
+        } else {
+            Err(lx::Error::ENOENT)
+        }
+    }
+
     /// This inode's own number as reported to the guest: its namespaced inode
     /// number under the shared superblock. Fixed for the inode's lifetime.
     pub(crate) fn guest_inode_nr(&self) -> lx::ino_t {

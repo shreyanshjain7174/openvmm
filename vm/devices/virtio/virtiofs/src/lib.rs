@@ -417,6 +417,7 @@ impl Fuse for VirtioFs {
             return Err(lx::Error::EXDEV);
         }
         self.check_writable(&inode)?;
+        self.check_writable(&new_inode)?;
         inode.rename(name, &new_inode, new_name, flags)?;
         // A rename doesn't preserve inode identity on path-keyed volumes, so
         // evict both the vacated source path and the overwritten destination
@@ -527,6 +528,8 @@ impl VirtioFs {
     fn check_writable(&self, inode: &VirtioFsInode) -> lx::Result<()> {
         if inode.readonly() {
             Err(lx::Error::EROFS)
+        } else if inode.is_restricted_root() {
+            Err(lx::Error::EACCES)
         } else {
             Ok(())
         }
@@ -600,6 +603,7 @@ impl VirtioFs {
     }
 
     fn lookup_helper(&self, inode: &VirtioFsInode, name: &lx::LxStr) -> lx::Result<fuse_entry_out> {
+        inode.check_allowed_child(name)?;
         let (new_inode, attr) = inode.lookup_child(name)?;
         let (_, new_inode_nr) = self.insert_inode(new_inode);
         Ok(fuse_entry_out::new(
@@ -661,6 +665,27 @@ impl VirtioFs {
     /// Remove the file with the specified node ID.
     fn remove_file(&self, fh: u64) {
         self.inner.files.write().remove(fh);
+    }
+
+    /// Lists the names a non-plus readdir returns for a directory inode.
+    #[cfg(test)]
+    pub(crate) fn read_dir_names_for_test(&self, node_id: u64) -> lx::Result<Vec<String>> {
+        use zerocopy::FromBytes;
+        let file = self
+            .get_inode(node_id)?
+            .open((lx::O_RDONLY | lx::O_DIRECTORY) as u32)?;
+        let buffer = file.read_dir(self, 0, 64 * 1024, false)?;
+        let mut names = Vec::new();
+        let mut rest = buffer.as_slice();
+        while let Ok((dirent, tail)) = fuse_dirent::read_from_prefix(rest) {
+            let len = dirent.namelen as usize;
+            let name = tail.get(..len).ok_or(lx::Error::EINVAL)?;
+            names.push(String::from_utf8_lossy(name).into_owned());
+            rest = rest
+                .get(fuse_dirent_align(size_of::<fuse_dirent>() + len)..)
+                .unwrap_or_default();
+        }
+        Ok(names)
     }
 }
 

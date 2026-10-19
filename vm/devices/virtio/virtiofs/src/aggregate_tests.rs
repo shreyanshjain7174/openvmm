@@ -254,3 +254,49 @@ async fn share_requests_add_and_remove_children(driver: pal_async::DefaultDriver
     drop(send);
     task.await;
 }
+
+#[test]
+fn restricted_child_exposes_only_allowed_names() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("allowed.txt"), b"a").unwrap();
+    std::fs::write(dir.path().join("secret.txt"), b"s").unwrap();
+
+    let fs = VirtioFs::new_aggregate();
+    fs.add_child_restricted("0", dir.path(), None, vec!["allowed.txt".into()])
+        .unwrap();
+    let root = fs
+        .lookup_synthetic_root(lx::LxStr::from_bytes(b"0"))
+        .unwrap();
+    let root = fs.get_inode(root.nodeid).unwrap();
+
+    let allowed = fs
+        .lookup_helper(&root, lx::LxStr::from_bytes(b"allowed.txt"))
+        .unwrap();
+    assert_eq!(
+        fs.lookup_helper(&root, lx::LxStr::from_bytes(b"secret.txt"))
+            .unwrap_err(),
+        lx::Error::ENOENT
+    );
+
+    // The restricted root itself rejects namespace changes.
+    assert_eq!(fs.check_writable(&root).unwrap_err(), lx::Error::EACCES);
+    // The allowed file stays writable.
+    fs.check_writable(&fs.get_inode(allowed.nodeid).unwrap())
+        .unwrap();
+}
+#[test]
+fn restricted_child_readdir_lists_only_allowed_names() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("allowed.txt"), b"a").unwrap();
+    std::fs::write(dir.path().join("secret.txt"), b"s").unwrap();
+
+    let fs = VirtioFs::new_aggregate();
+    fs.add_child_restricted("0", dir.path(), None, vec!["allowed.txt".into()])
+        .unwrap();
+    let root = fs
+        .lookup_synthetic_root(lx::LxStr::from_bytes(b"0"))
+        .unwrap();
+    let names = fs.read_dir_names_for_test(root.nodeid).unwrap();
+    assert!(names.iter().any(|n| n == "allowed.txt"));
+    assert!(!names.iter().any(|n| n == "secret.txt"));
+}
