@@ -718,6 +718,30 @@ pub(crate) struct LoadedVm {
     running: bool,
 }
 
+/// Creates, connects and resumes a vmswitch synthetic NIC served over the vmbus proxy.
+#[cfg(windows)]
+fn new_kernel_vmnic(
+    cfg: &openvmm_defs::config::KernelVmNicConfig,
+    proxy: Option<&vmbus_server::ProxyIntegration>,
+) -> anyhow::Result<vmswitch::kernel::KernelVmNic> {
+    let mut nic = vmswitch::kernel::KernelVmNic::new(
+        &guid::Guid::new_random(),
+        "nic",
+        "nic",
+        cfg.mac_address.into(),
+        &cfg.instance_id,
+        proxy.context("missing vmbusproxy handle")?.handle(),
+    )
+    .context("failed to create a kernel vmnic")?;
+    nic.connect(&vmswitch::kernel::SwitchPortId {
+        switch: cfg.switch_port_id.switch,
+        port: cfg.switch_port_id.port,
+    })
+    .context("failed to connect kernel vmnic")?;
+    nic.resume().context("failed to resume the kernel vmnic")?;
+    Ok(nic)
+}
+
 /// Most of the VM state for [`LoadedVm`], excluding things that are necessary
 /// for state machine transitions.
 struct LoadedVmInner {
@@ -734,9 +758,9 @@ struct LoadedVmInner {
     vmbus_server: Option<VmbusServerHandle>,
     vtl2_vmbus_server: Option<VmbusServerHandle>,
     #[cfg(windows)]
-    _vmbus_proxy: Option<vmbus_server::ProxyIntegration>,
+    vmbus_proxy: Option<vmbus_server::ProxyIntegration>,
     #[cfg(windows)]
-    _kernel_vmnics: Vec<vmswitch::kernel::KernelVmNic>,
+    kernel_vmnics: std::collections::HashMap<guid::Guid, vmswitch::kernel::KernelVmNic>,
     numa_cfg: NumaTopology,
     mem_layout: MemoryLayout,
     processor_topology: ProcessorTopology,
@@ -2006,7 +2030,7 @@ impl InitializedVm {
         #[cfg(windows)]
         let mut vmbus_proxy = None;
         #[cfg(windows)]
-        let mut kernel_vmnics = Vec::new();
+        let mut kernel_vmnics = std::collections::HashMap::new();
         let mut vmbus_server = None;
         let mut vtl2_vmbus_server = None;
         let mut vtl2_hvsock_relay = None;
@@ -2666,27 +2690,8 @@ impl InitializedVm {
         {
             #[cfg(windows)]
             for nic_config in cfg.kernel_vmnics {
-                let mut nic = vmswitch::kernel::KernelVmNic::new(
-                    &guid::Guid::new_random(),
-                    "nic",
-                    "nic",
-                    nic_config.mac_address.into(),
-                    &nic_config.instance_id,
-                    vmbus_proxy
-                        .as_ref()
-                        .context("missing vmbusproxy handle")?
-                        .handle(),
-                )
-                .context("failed to create a kernel vmnic")?;
-
-                nic.connect(&vmswitch::kernel::SwitchPortId {
-                    switch: nic_config.switch_port_id.switch,
-                    port: nic_config.switch_port_id.port,
-                })
-                .context("failed to connect kernel vmnic")?;
-
-                nic.resume().context("failed to resume the kernel vmnic")?;
-                kernel_vmnics.push(nic);
+                let nic = new_kernel_vmnic(&nic_config, vmbus_proxy.as_ref())?;
+                kernel_vmnics.insert(nic_config.instance_id, nic);
             }
 
             if partition.supports_virtual_devices() {
@@ -2994,9 +2999,9 @@ impl InitializedVm {
                 input_distributor,
                 vtl2_framebuffer_gpa_base,
                 #[cfg(windows)]
-                _vmbus_proxy: vmbus_proxy,
+                vmbus_proxy,
                 #[cfg(windows)]
-                _kernel_vmnics: kernel_vmnics,
+                kernel_vmnics,
                 _vmbus_devices: vmbus_devices,
                 dynamic_vmbus_devices: std::collections::HashMap::new(),
                 removed_dynamic_vmbus_devices: std::collections::HashSet::new(),
@@ -3865,6 +3870,40 @@ impl LoadedVm {
                         })
                         .await
                     }
+                    VmRpc::AddKernelVmNic(rpc) => rpc.handle_failable_sync(|cfg| {
+                        #[cfg(windows)]
+                        {
+                            anyhow::ensure!(
+                                !self.inner.kernel_vmnics.contains_key(&cfg.instance_id),
+                                "a kernel vmnic already exists at instance ID {}",
+                                cfg.instance_id
+                            );
+                            let nic = new_kernel_vmnic(&cfg, self.inner.vmbus_proxy.as_ref())?;
+                            self.inner.kernel_vmnics.insert(cfg.instance_id, nic);
+                            anyhow::Ok(())
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            let _ = cfg;
+                            anyhow::bail!("kernel vmnics are only supported on Windows")
+                        }
+                    }),
+                    VmRpc::RemoveKernelVmNic(rpc) => rpc.handle_failable_sync(|instance_id| {
+                        #[cfg(windows)]
+                        {
+                            // Dropping the NIC closes it; vmswitch then revokes its channel.
+                            self.inner
+                                .kernel_vmnics
+                                .remove(&instance_id)
+                                .with_context(|| format!("no kernel vmnic at instance ID {instance_id}"))?;
+                            anyhow::Ok(())
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            let _ = instance_id;
+                            anyhow::bail!("kernel vmnics are only supported on Windows")
+                        }
+                    }),
                     VmRpc::DumpState(rpc) => {
                         rpc.handle_failable(async |file| self.dump_state(file).await)
                             .await

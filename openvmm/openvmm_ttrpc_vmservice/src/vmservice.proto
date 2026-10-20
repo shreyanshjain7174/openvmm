@@ -665,6 +665,8 @@ message NICConfig {
         DioBackend dio = 6;
         TapBackend tap = 7;
         ConsommeBackend consomme = 8;
+        // Windows: a vmswitch synthetic NIC on an existing switch port, served over the vmbus proxy.
+        DioBackend kernel_vmnic = 9;
     }
 }
 

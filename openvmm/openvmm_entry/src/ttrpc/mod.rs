@@ -977,7 +977,11 @@ impl VmService {
             vga_firmware: None,
             vtl2_gfx: false,
             virtio_devices: vec![],
-            vmbus: Some(VmbusConfig::default()),
+            vmbus: Some(VmbusConfig {
+                #[cfg(windows)]
+                vmbusproxy_handle: open_vmbus_proxy(),
+                ..Default::default()
+            }),
             vtl2_vmbus: None,
             vmbus_devices: vec![],
             #[cfg(windows)]
@@ -1413,6 +1417,22 @@ impl VmService {
                         );
                     }
                     let instance_id = nic.nic_id.parse().context("invalid instance ID")?;
+                    #[cfg(windows)]
+                    if let Some(vmservice::nic_config::Backend::KernelVmnic(port)) = &nic.backend {
+                        let cfg = openvmm_defs::config::KernelVmNicConfig {
+                            instance_id,
+                            mac_address: nic
+                                .mac_address
+                                .parse::<MacAddress>()
+                                .context("invalid mac address")?,
+                            switch_port_id: openvmm_defs::config::SwitchPortId {
+                                switch: port.switch_id.parse().context("invalid switch ID")?,
+                                port: port.port_id.parse().context("invalid port ID")?,
+                            },
+                        };
+                        let recv = vm.worker_rpc.call_failable(VmRpc::AddKernelVmNic, cfg);
+                        return Ok(async move { recv.await.map_err(anyhow::Error::from) }.boxed());
+                    }
                     let (vtl, resource) = parse_nic_config(nic, None, &self.registry)?;
                     let recv = vm
                         .worker_rpc
@@ -1440,6 +1460,17 @@ impl VmService {
                     }
                     .boxed())
                 } else if request.r#type == vmservice::ModifyType::Remove as i32 {
+                    #[cfg(windows)]
+                    if matches!(
+                        nic.backend,
+                        Some(vmservice::nic_config::Backend::KernelVmnic(_))
+                    ) {
+                        let instance_id = nic.nic_id.parse().context("invalid instance ID")?;
+                        let recv = vm
+                            .worker_rpc
+                            .call_failable(VmRpc::RemoveKernelVmNic, instance_id);
+                        return Ok(async move { recv.await.map_err(anyhow::Error::from) }.boxed());
+                    }
                     #[cfg(windows)]
                     if matches!(nic.backend, Some(vmservice::nic_config::Backend::Dio(_))) {
                         let instance_id = parse_dio_remove_nic_id(&nic)?;
@@ -1655,6 +1686,19 @@ fn parse_nic_config(
         max_queues: None,
     };
     Ok((DeviceVtl::Vtl0, cfg.into_resource()))
+}
+
+/// Opens the vmbus proxy that kernel vmnics need; VMs still start without it.
+#[cfg(windows)]
+fn open_vmbus_proxy() -> Option<vmbus_proxy::ProxyHandle> {
+    vmbus_proxy::ProxyHandle::new()
+        .inspect_err(|err| {
+            tracing::warn!(
+                error = err as &dyn std::error::Error,
+                "vmbus proxy unavailable; kernel vmnics are disabled"
+            )
+        })
+        .ok()
 }
 
 #[cfg(windows)]

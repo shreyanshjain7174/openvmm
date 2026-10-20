@@ -27,6 +27,10 @@ pub enum VmRpc {
     Nmi(Rpc<u32, ()>),
     AddVmbusDevice(FailableRpc<(Guid, DeviceVtl, Resource<VmbusDeviceHandleKind>), ()>),
     RemoveVmbusDevice(FailableRpc<Guid, ()>),
+    /// Hot-add a vmswitch synthetic NIC served over the vmbus proxy.
+    AddKernelVmNic(FailableRpc<crate::config::KernelVmNicConfig, ()>),
+    /// Hot-remove a kernel synthetic NIC by instance ID.
+    RemoveKernelVmNic(FailableRpc<Guid, ()>),
     ConnectHvsock(FailableRpc<(CancelContext, Guid, DeviceVtl), unix_socket::UnixStream>),
     PulseSaveRestore(Rpc<(), Result<(), PulseSaveRestoreError>>),
     StartReloadIgvm(FailableRpc<File, ()>),
@@ -75,6 +79,8 @@ impl fmt::Debug for VmRpc {
             VmRpc::Nmi(_) => "Nmi",
             VmRpc::AddVmbusDevice(_) => "AddVmbusDevice",
             VmRpc::RemoveVmbusDevice(_) => "RemoveVmbusDevice",
+            VmRpc::AddKernelVmNic(_) => "AddKernelVmNic",
+            VmRpc::RemoveKernelVmNic(_) => "RemoveKernelVmNic",
             VmRpc::ConnectHvsock(_) => "ConnectHvsock",
             VmRpc::PulseSaveRestore(_) => "PulseSaveRestore",
             VmRpc::StartReloadIgvm(_) => "StartReloadIgvm",
