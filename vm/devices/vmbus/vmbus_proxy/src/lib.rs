@@ -233,7 +233,8 @@ impl VmbusProxy {
         };
 
         let size = r?;
-        assert_eq!(size, output.len(), "ioctl returned unexpected size");
+        // Older drivers return the shorter NEXT_ACTION output without DeviceOrder; the rest stays zeroed.
+        assert!(size <= output.len(), "ioctl returned unexpected size");
         Ok(output)
     }
 
