@@ -2978,6 +2978,12 @@ pub enum EndpointConfigCli {
     Tap {
         name: String,
     },
+    /// `ratelimit:<bytes_per_sec>:<packets_per_sec>:<endpoint>`, 0 = unlimited.
+    RateLimit {
+        bytes_per_sec: Option<u64>,
+        packets_per_sec: Option<u64>,
+        endpoint: Box<EndpointConfigCli>,
+    },
 }
 
 /// Parsed host port forwarding configuration from the CLI.
@@ -3098,6 +3104,21 @@ impl FromStr for EndpointConfigCli {
             ["tap", name] => EndpointConfigCli::Tap {
                 name: (*name).to_owned(),
             },
+            ["ratelimit", bps, pps, rest @ ..] if !rest.is_empty() => {
+                let rate = |s: &str| -> Result<Option<u64>, String> {
+                    let v: u64 = s.parse().map_err(|_| format!("invalid rate limit '{s}'"))?;
+                    Ok((v != 0).then_some(v))
+                };
+                let endpoint: EndpointConfigCli = rest.join(":").parse()?;
+                if matches!(endpoint, EndpointConfigCli::RateLimit { .. }) {
+                    return Err("nested ratelimit backends are not supported".into());
+                }
+                EndpointConfigCli::RateLimit {
+                    bytes_per_sec: rate(bps)?,
+                    packets_per_sec: rate(pps)?,
+                    endpoint: Box::new(endpoint),
+                }
+            }
             _ => return Err("invalid network backend".into()),
         };
 
@@ -4414,6 +4435,33 @@ mod tests {
         assert!(SerialConfigCli::from_str("unknown").is_err());
         assert!(SerialConfigCli::from_str("file").is_err());
         assert!(SerialConfigCli::from_str("listen").is_err());
+    }
+
+    #[test]
+    fn test_ratelimit_endpoint_from_str() {
+        match EndpointConfigCli::from_str("ratelimit:1250000:0:consomme").unwrap() {
+            EndpointConfigCli::RateLimit {
+                bytes_per_sec,
+                packets_per_sec,
+                endpoint,
+            } => {
+                assert_eq!(bytes_per_sec, Some(1_250_000));
+                assert_eq!(packets_per_sec, None);
+                assert!(matches!(*endpoint, EndpointConfigCli::Consomme { .. }));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            EndpointConfigCli::from_str("ratelimit:0:1000:none").unwrap(),
+            EndpointConfigCli::RateLimit {
+                bytes_per_sec: None,
+                packets_per_sec: Some(1000),
+                ..
+            }
+        ));
+        assert!(EndpointConfigCli::from_str("ratelimit:x:1:none").is_err());
+        assert!(EndpointConfigCli::from_str("ratelimit:1:none").is_err());
+        assert!(EndpointConfigCli::from_str("ratelimit:1:1:ratelimit:1:1:none").is_err());
     }
 
     #[test]

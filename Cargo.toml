@@ -306,6 +306,7 @@ net_dio = { path = "vm/devices/net/net_dio" }
 net_mana = { path = "vm/devices/net/net_mana" }
 net_tap = { path = "vm/devices/net/net_tap" }
 net_packet_capture = { path = "vm/devices/net/net_packet_capture" }
+net_ratelimit = { path = "vm/devices/net/net_ratelimit" }
 netvsp = { path = "vm/devices/net/netvsp" }
 netvsp_protocol = { path = "vm/devices/net/netvsp_protocol" }
 netvsp_resources = { path = "vm/devices/net/netvsp_resources" }

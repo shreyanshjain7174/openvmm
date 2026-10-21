@@ -2326,7 +2326,18 @@ fn parse_endpoint(
     resources: &mut VmResources,
 ) -> anyhow::Result<NicConfig> {
     let _ = resources;
-    let endpoint = match &cli_cfg.endpoint {
+    let (endpoint_cli, limits) = match &cli_cfg.endpoint {
+        EndpointConfigCli::RateLimit {
+            bytes_per_sec,
+            packets_per_sec,
+            endpoint,
+        } => (endpoint.as_ref(), Some((*bytes_per_sec, *packets_per_sec))),
+        other => (other, None),
+    };
+    let endpoint = match endpoint_cli {
+        EndpointConfigCli::RateLimit { .. } => {
+            bail!("nested ratelimit backends are not supported")
+        }
         EndpointConfigCli::Consomme { cidr, host_fwd } => {
             let ports = host_fwd
                 .iter()
@@ -2397,6 +2408,17 @@ fn parse_endpoint(
                 bail!("TAP backend is only supported on Linux")
             }
         }
+    };
+    let endpoint = match limits {
+        Some((bytes_per_sec, packets_per_sec)) => {
+            net_backend_resources::ratelimit::RateLimitHandle {
+                endpoint,
+                bytes_per_sec,
+                packets_per_sec,
+            }
+            .into_resource()
+        }
+        None => endpoint,
     };
 
     // Pick a random MAC address.

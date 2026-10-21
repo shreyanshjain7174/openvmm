@@ -5162,6 +5162,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "net_ratelimit"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "guestmem",
+ "inspect",
+ "net_backend",
+ "net_backend_resources",
+ "pal_async",
+ "parking_lot",
+ "token_bucket",
+ "vm_resource",
+]
+
+[[package]]
 name = "net_tap"
 version = "0.0.0"
 dependencies = [
@@ -6271,6 +6287,7 @@ dependencies = [
  "net_backend",
  "net_consomme",
  "net_dio",
+ "net_ratelimit",
  "net_tap",
  "netvsp",
  "nvme",

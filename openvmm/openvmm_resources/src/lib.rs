@@ -59,6 +59,7 @@ vm_resource::register_static_resolvers! {
 
     // Network backends
     net_backend::null::NullResolver,
+    net_ratelimit::resolver::RateLimitResolver,
     #[cfg(feature = "net_consomme")]
     net_consomme::resolver::ConsommeResolver,
     #[cfg(all(feature = "net_tap", target_os = "linux"))]

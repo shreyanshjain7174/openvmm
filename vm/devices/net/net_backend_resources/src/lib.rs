@@ -25,6 +25,31 @@ pub mod null {
     }
 }
 
+/// Rate-limiting wrapper backend.
+pub mod ratelimit {
+    use mesh::MeshPayload;
+    use vm_resource::Resource;
+    use vm_resource::ResourceId;
+    use vm_resource::kind::NetEndpointHandleKind;
+
+    /// Handle to an endpoint whose transmit and receive traffic is limited.
+    /// Each limit applies separately to each direction. `None` means
+    /// unlimited.
+    #[derive(MeshPayload)]
+    pub struct RateLimitHandle {
+        /// The endpoint being limited.
+        pub endpoint: Resource<NetEndpointHandleKind>,
+        /// Maximum bytes per second in each direction.
+        pub bytes_per_sec: Option<u64>,
+        /// Maximum packets per second in each direction.
+        pub packets_per_sec: Option<u64>,
+    }
+
+    impl ResourceId<NetEndpointHandleKind> for RateLimitHandle {
+        const ID: &'static str = "ratelimit";
+    }
+}
+
 /// Consomme backend.
 pub mod consomme {
     use mesh::MeshPayload;

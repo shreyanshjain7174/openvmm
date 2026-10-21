@@ -1,0 +1,25 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "net_ratelimit"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+net_backend.workspace = true
+net_backend_resources.workspace = true
+token_bucket.workspace = true
+vm_resource.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+guestmem.workspace = true
+inspect.workspace = true
+pal_async.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+
+[lints]
+workspace = true
