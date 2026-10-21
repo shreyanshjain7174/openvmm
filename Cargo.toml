@@ -192,6 +192,7 @@ term = { path = "support/term" }
 test_with_tracing = { path = "support/test_with_tracing" }
 test_with_tracing_macro = { path = "support/test_with_tracing/test_with_tracing_macro" }
 tracelimit = { path = "support/tracelimit" }
+token_bucket = { path = "support/token_bucket" }
 tracing_helpers = { path = "support/tracing_helpers" }
 trycopy = { path = "support/trycopy" }
 ucs2 = { path = "support/ucs2" }
@@ -342,6 +343,7 @@ disk_get_vmgs = { path = "vm/devices/storage/disk_get_vmgs" }
 disk_layered = { path = "vm/devices/storage/disk_layered" }
 disk_nvme = { path = "vm/devices/storage/disk_nvme" }
 disk_delay = { path = "vm/devices/storage/disk_delay" }
+disk_ratelimit = { path = "vm/devices/storage/disk_ratelimit" }
 disk_prwrap = { path = "vm/devices/storage/disk_prwrap" }
 disk_striped = { path = "vm/devices/storage/disk_striped" }
 disk_vhd1 = { path = "vm/devices/storage/disk_vhd1" }

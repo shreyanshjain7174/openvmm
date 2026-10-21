@@ -61,6 +61,21 @@ impl ResourceId<DiskHandleKind> for DelayDiskHandle {
     const ID: &'static str = "delay";
 }
 
+/// Disk handle for a disk whose reads and writes are rate limited.
+#[derive(MeshPayload)]
+pub struct RateLimitDiskHandle {
+    /// The underlying disk resource.
+    pub disk: Resource<DiskHandleKind>,
+    /// Maximum read+write bytes per second. `None` means unlimited.
+    pub bytes_per_sec: Option<u64>,
+    /// Maximum read+write operations per second. `None` means unlimited.
+    pub ops_per_sec: Option<u64>,
+}
+
+impl ResourceId<DiskHandleKind> for RateLimitDiskHandle {
+    const ID: &'static str = "ratelimit";
+}
+
 /// Disk handle for a fixed VHD1 disk.
 #[derive(MeshPayload)]
 pub struct FixedVhd1DiskHandle(pub std::fs::File);

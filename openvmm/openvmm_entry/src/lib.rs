@@ -2553,6 +2553,15 @@ fn disk_open_inner<'a>(
                 delay: CellUpdater::new(Duration::from_millis(*delay_ms)).cell(),
                 disk: disk_open(inner, read_only).await?,
             })),
+            DiskCliKind::RateLimitDiskWrapper {
+                bytes_per_sec,
+                ops_per_sec,
+                disk: inner,
+            } => layers.push(disk(disk_backend_resources::RateLimitDiskHandle {
+                bytes_per_sec: *bytes_per_sec,
+                ops_per_sec: *ops_per_sec,
+                disk: disk_open(inner, read_only).await?,
+            })),
             DiskCliKind::Crypt {
                 disk: inner,
                 cipher,

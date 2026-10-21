@@ -2145,6 +2145,12 @@ pub enum DiskCliKind {
         delay_ms: u64,
         disk: Box<DiskCliKind>,
     },
+    // ratelimit:<bytes_per_sec>:<ops_per_sec>:<kind> (0 = unlimited)
+    RateLimitDiskWrapper {
+        bytes_per_sec: Option<u64>,
+        ops_per_sec: Option<u64>,
+        disk: Box<DiskCliKind>,
+    },
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq)]
@@ -2273,6 +2279,23 @@ impl FromStr for DiskCliKind {
                     let (delay_ms, kind) = arg.split_once(':').context("expected delay_ms:kind")?;
                     DiskCliKind::DelayDiskWrapper {
                         delay_ms: delay_ms.parse().context("invalid disk delay")?,
+                        disk: Box::new(kind.parse()?),
+                    }
+                }
+                "ratelimit" => {
+                    let mut parts = arg.splitn(3, ':');
+                    let (Some(bps), Some(ops), Some(kind)) =
+                        (parts.next(), parts.next(), parts.next())
+                    else {
+                        anyhow::bail!("expected bytes_per_sec:ops_per_sec:kind");
+                    };
+                    let rate = |s: &str| -> anyhow::Result<Option<u64>> {
+                        let v: u64 = s.parse().context("invalid rate limit")?;
+                        Ok((v != 0).then_some(v))
+                    };
+                    DiskCliKind::RateLimitDiskWrapper {
+                        bytes_per_sec: rate(bps)?,
+                        ops_per_sec: rate(ops)?,
                         disk: Box::new(kind.parse()?),
                     }
                 }
@@ -4043,6 +4066,35 @@ mod tests {
 
         // direct rejected for sql disks
         assert!(DiskCliKind::from_str("sql:db.sqlite;direct").is_err());
+    }
+
+    #[test]
+    fn test_parse_ratelimit_disk() {
+        match DiskCliKind::from_str("ratelimit:10485760:500:mem:1G").unwrap() {
+            DiskCliKind::RateLimitDiskWrapper {
+                bytes_per_sec,
+                ops_per_sec,
+                disk,
+            } => {
+                assert_eq!(bytes_per_sec, Some(10 * 1024 * 1024));
+                assert_eq!(ops_per_sec, Some(500));
+                assert!(matches!(*disk, DiskCliKind::Memory(_)));
+            }
+            _ => panic!("Expected RateLimitDiskWrapper variant"),
+        }
+        match DiskCliKind::from_str("ratelimit:0:100:mem:1G").unwrap() {
+            DiskCliKind::RateLimitDiskWrapper {
+                bytes_per_sec,
+                ops_per_sec,
+                ..
+            } => {
+                assert_eq!(bytes_per_sec, None);
+                assert_eq!(ops_per_sec, Some(100));
+            }
+            _ => panic!("Expected RateLimitDiskWrapper variant"),
+        }
+        assert!(DiskCliKind::from_str("ratelimit:abc:1:mem:1G").is_err());
+        assert!(DiskCliKind::from_str("ratelimit:1:mem:1G").is_err());
     }
 
     #[test]

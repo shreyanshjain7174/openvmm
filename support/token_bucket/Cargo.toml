@@ -1,0 +1,10 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "token_bucket"
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
