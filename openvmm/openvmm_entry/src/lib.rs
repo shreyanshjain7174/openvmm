@@ -2720,6 +2720,26 @@ fn do_main(pidfile_guard: &mut Option<pidfile::Pidfile>) -> anyhow::Result<i32> 
     // not return). Any worker host setup errors are return and bubbled up.
     meshworker::run_vmm_mesh_host()?;
 
+    // SPIKE (local only): OVM_SPIKE_JOB_CPU=cap:N | weight:N | minmax:MIN:MAX puts this
+    // process tree (incl. the VM worker spawned later) in a CPU-rate-controlled job.
+    #[cfg(windows)]
+    if let Ok(spec) = std::env::var("OVM_SPIKE_JOB_CPU") {
+        let mut it = spec.split(':');
+        let kind = it.next().unwrap_or_default();
+        let v: Vec<u32> = it.map(|x| x.parse()).collect::<Result<_, _>>()?;
+        let (flags, value) = match (kind, v.as_slice()) {
+            ("cap", [r]) => (0x1 | 0x4, *r),
+            ("weight", [w]) => (0x1 | 0x2, *w),
+            ("minmax", [min, max]) => (0x1 | 0x10, min | (max << 16)),
+            _ => anyhow::bail!("bad OVM_SPIKE_JOB_CPU '{spec}'"),
+        };
+        let job = pal::windows::job::Job::new()?;
+        job.spike_set_cpu_rate(flags, value)?;
+        job.spike_assign_current_process()?;
+        tracing::info!(spec, flags, value, "SPIKE job cpu rate");
+        std::mem::forget(job);
+    }
+
     let opt = cli_args::parse_options();
 
     // Print the version number. This comes after argument parsing to not interfere

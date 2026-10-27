@@ -3956,7 +3956,9 @@ impl LoadedVm {
                     VmRpc::SetProcessorQos(rpc) => {
                         rpc.handle_failable(async |qos| {
                             // WHP rejects this while a VP is running, so pause around it.
-                            let was_running = self.pause().await;
+                            // SPIKE (local only): OVM_SPIKE_NO_PAUSE tests the live path.
+                            let was_running = std::env::var_os("OVM_SPIKE_NO_PAUSE").is_none()
+                                && self.pause().await;
                             let result = self.inner.partition.set_processor_qos(&qos);
                             if was_running {
                                 self.resume().await;

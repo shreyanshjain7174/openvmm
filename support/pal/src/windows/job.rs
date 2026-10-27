@@ -56,6 +56,44 @@ impl Job {
         }
         Ok(())
     }
+
+    /// SPIKE (local only): sets `JobObjectCpuRateControlInformation` (flags + rate/weight/min|max<<16).
+    pub fn spike_set_cpu_rate(&self, flags: u32, value: u32) -> io::Result<()> {
+        #[repr(C)]
+        struct Info {
+            flags: u32,
+            value: u32,
+        }
+        let mut info = Info { flags, value };
+        // SAFETY: valid job handle and a correctly sized buffer.
+        let r = unsafe {
+            windows_sys::Win32::System::JobObjects::SetInformationJobObject(
+                self.0.as_raw_handle(),
+                windows_sys::Win32::System::JobObjects::JobObjectCpuRateControlInformation,
+                std::ptr::from_mut(&mut info).cast(),
+                size_of_val(&info) as u32,
+            )
+        };
+        if r == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// SPIKE (local only): assigns the current process to the job.
+    pub fn spike_assign_current_process(&self) -> io::Result<()> {
+        // SAFETY: valid job handle and the current-process pseudo handle.
+        let r = unsafe {
+            windows_sys::Win32::System::JobObjects::AssignProcessToJobObject(
+                self.0.as_raw_handle(),
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            )
+        };
+        if r == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 impl AsHandle for Job {

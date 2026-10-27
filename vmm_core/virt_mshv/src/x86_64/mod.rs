@@ -635,6 +635,27 @@ impl virt::Partition for MshvPartition {
         self.inner.isolation.snp().is_none().then_some(self)
     }
 
+    // SPIKE (local only): CPU scheduling properties on MSHV, set and read back, no VP pause.
+    fn set_processor_qos(&self, qos: &virt::ProcessorQos) -> anyhow::Result<()> {
+        let frac = |v: u32| u64::from(v) * 65536 / 100000;
+        let vmfd = &self.inner.vmfd;
+        for (code, v) in [
+            (HvPartitionPropertyCode::CpuCap, qos.limit.map(frac)),
+            (HvPartitionPropertyCode::CpuReserve, qos.reserve.map(frac)),
+            (HvPartitionPropertyCode::CpuWeight, qos.weight.map(u64::from)),
+        ] {
+            if let Some(v) = v {
+                vmfd.set_partition_property(code.0, v)
+                    .map_err(|e| anyhow::anyhow!("set {code:?}={v}: {e}"))?;
+                let back = vmfd
+                    .get_partition_property(code.0)
+                    .map_err(|e| anyhow::anyhow!("get {code:?}: {e}"))?;
+                tracing::info!(?code, v, back, "SPIKE mshv cpu prop");
+            }
+        }
+        Ok(())
+    }
+
     fn doorbell_registration(
         self: &Arc<Self>,
         _minimum_vtl: Vtl,
