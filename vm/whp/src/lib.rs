@@ -741,6 +741,11 @@ impl Partition {
         self.get_property(partition_prop::PhysicalAddressWidth)
     }
 
+    /// SPIKE: reads back the partition's CpuGroupId.
+    pub fn cpu_group_id(&self) -> Result<u64> {
+        self.get_property(partition_prop::CpuGroupId)
+    }
+
     /// SPIKE: reads back (CpuCap, CpuWeight, CpuReserve).
     pub fn cpu_sched_props(&self) -> Result<(u32, u32, u32)> {
         Ok((

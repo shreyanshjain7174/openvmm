@@ -1769,7 +1769,25 @@ impl VtlPartition {
             .set_property(whp::PartitionProperty::ExtendedVmExits(extended_exits))
             .for_op("set extended vm exits")?;
 
+        // SPIKE: join a host cpugroup; must precede WHvSetupPartition.
+        let cpu_group = std::env::var("OVM_SPIKE_WHP_CPU_GROUP").ok().map(|v| {
+            v.trim()
+                .parse::<u64>()
+                .expect("OVM_SPIKE_WHP_CPU_GROUP must be a u64")
+        });
+        if let Some(v) = cpu_group {
+            whp_config
+                .set_property(whp::PartitionProperty::CpuGroupId(v))
+                .for_op("set cpu group")?;
+        }
+
         let whp = whp_config.create().for_op("set up partition")?;
+        if let Some(v) = cpu_group {
+            match whp.cpu_group_id() {
+                Ok(back) => tracing::info!(req = v, back, "SPIKE whp cpu group"),
+                Err(e) => tracing::warn!(req = v, error = %e, "SPIKE whp cpu group read-back failed"),
+            }
+        }
         whp.suspend_time().for_op("suspend partition time")?;
 
         for vp in config.processor_topology.vps() {
