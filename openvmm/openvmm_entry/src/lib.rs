@@ -2709,6 +2709,40 @@ fn prepare_snapshot_restore(
     Ok((shared_memory_fd, state_msg))
 }
 
+/// SPIKE (local only): parses `cap:N | weight:N | minmax:MIN:MAX` into
+/// `JobObjectCpuRateControlInformation` `(control_flags, value)`.
+#[cfg(windows)]
+fn spike_parse_job_cpu(spec: &str) -> anyhow::Result<(u32, u32)> {
+    let mut it = spec.split(':');
+    let kind = it.next().unwrap_or_default();
+    let v: Vec<u32> = it
+        .map(|x| x.parse())
+        .collect::<Result<_, _>>()
+        .with_context(|| format!("bad job cpu spec '{spec}'"))?;
+    Ok(match (kind, v.as_slice()) {
+        ("cap", [r]) => (0x1 | 0x4, *r),
+        ("weight", [w]) => (0x1 | 0x2, *w),
+        ("minmax", [min, max]) => (0x1 | 0x10, min | (max << 16)),
+        _ => anyhow::bail!("bad job cpu spec '{spec}'"),
+    })
+}
+
+#[cfg(all(test, windows))]
+mod spike_tests {
+    use super::*;
+
+    #[test]
+    fn spike_parse_job_cpu_specs() {
+        assert_eq!(spike_parse_job_cpu("cap:625").unwrap(), (0x5, 625));
+        assert_eq!(spike_parse_job_cpu("weight:6").unwrap(), (0x3, 6));
+        assert_eq!(
+            spike_parse_job_cpu("minmax:5000:10000").unwrap(),
+            (0x11, 5000 | (10000 << 16))
+        );
+        assert!(spike_parse_job_cpu("cap").is_err());
+    }
+}
+
 fn do_main(pidfile_guard: &mut Option<pidfile::Pidfile>) -> anyhow::Result<i32> {
     #[cfg(windows)]
     pal::windows::disable_hard_error_dialog();
@@ -2722,21 +2756,43 @@ fn do_main(pidfile_guard: &mut Option<pidfile::Pidfile>) -> anyhow::Result<i32> 
 
     // SPIKE (local only): OVM_SPIKE_JOB_CPU=cap:N | weight:N | minmax:MIN:MAX puts this
     // process tree (incl. the VM worker spawned later) in a CPU-rate-controlled job.
+    // OVM_SPIKE_JOB_CPU_AT=SECS:SPEC re-applies SPEC to the same job after SECS.
     #[cfg(windows)]
     if let Ok(spec) = std::env::var("OVM_SPIKE_JOB_CPU") {
-        let mut it = spec.split(':');
-        let kind = it.next().unwrap_or_default();
-        let v: Vec<u32> = it.map(|x| x.parse()).collect::<Result<_, _>>()?;
-        let (flags, value) = match (kind, v.as_slice()) {
-            ("cap", [r]) => (0x1 | 0x4, *r),
-            ("weight", [w]) => (0x1 | 0x2, *w),
-            ("minmax", [min, max]) => (0x1 | 0x10, min | (max << 16)),
-            _ => anyhow::bail!("bad OVM_SPIKE_JOB_CPU '{spec}'"),
-        };
-        let job = pal::windows::job::Job::new()?;
+        let (flags, value) = spike_parse_job_cpu(&spec).context("bad OVM_SPIKE_JOB_CPU")?;
+        let at = std::env::var("OVM_SPIKE_JOB_CPU_AT")
+            .ok()
+            .map(|at| {
+                let (secs, spec) = at
+                    .split_once(':')
+                    .with_context(|| format!("bad OVM_SPIKE_JOB_CPU_AT '{at}'"))?;
+                let secs: u64 = secs
+                    .parse()
+                    .with_context(|| format!("bad OVM_SPIKE_JOB_CPU_AT '{at}'"))?;
+                let (flags, value) =
+                    spike_parse_job_cpu(spec).context("bad OVM_SPIKE_JOB_CPU_AT")?;
+                anyhow::Ok((secs, spec.to_owned(), flags, value))
+            })
+            .transpose()?;
+        let job = Arc::new(pal::windows::job::Job::new()?);
         job.spike_set_cpu_rate(flags, value)?;
         job.spike_assign_current_process()?;
         tracing::info!(spec, flags, value, "SPIKE job cpu rate");
+        if let Some((secs, spec, flags, value)) = at {
+            let job = job.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_secs(secs));
+                match job.spike_set_cpu_rate(flags, value) {
+                    Ok(()) => tracing::info!(spec, flags, value, "SPIKE job cpu rate changed"),
+                    Err(err) => tracing::error!(
+                        spec,
+                        error = &err as &dyn std::error::Error,
+                        "SPIKE job cpu rate change failed"
+                    ),
+                }
+            });
+        }
+        // Keep the job handle open for the process lifetime.
         std::mem::forget(job);
     }
 
