@@ -678,6 +678,19 @@ impl virt::Partition for WhpPartition {
             if let Some(v) = qos.weight {
                 whp.set_property(P::CpuWeight(v))?;
             }
+            // SPIKE: read back what the hypervisor holds after the set.
+            match whp.cpu_sched_props() {
+                Ok((cap, weight, reserve)) => tracing::info!(
+                    req_limit = ?qos.limit,
+                    req_weight = ?qos.weight,
+                    req_reserve = ?qos.reserve,
+                    cap,
+                    weight,
+                    reserve,
+                    "SPIKE whp cpu prop"
+                ),
+                Err(e) => tracing::warn!(error = %e, "SPIKE whp cpu prop read-back failed"),
+            }
         }
         Ok(())
     }
@@ -1845,6 +1858,9 @@ impl VtlPartition {
     fn reset_whp(&self) -> Result<(), Error> {
         let mut time_frozen = self.time_frozen.lock();
         self.whp.reset().for_op("reset partition")?;
+        if let Ok((cap, weight, reserve)) = self.whp.cpu_sched_props() {
+            tracing::info!(cap, weight, reserve, "SPIKE whp cpu prop after reset");
+        }
         // WHP reset freezes time until an explicit resume or the first VP run.
         *time_frozen = true;
         Ok(())

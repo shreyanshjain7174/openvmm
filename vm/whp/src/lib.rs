@@ -741,6 +741,15 @@ impl Partition {
         self.get_property(partition_prop::PhysicalAddressWidth)
     }
 
+    /// SPIKE: reads back (CpuCap, CpuWeight, CpuReserve).
+    pub fn cpu_sched_props(&self) -> Result<(u32, u32, u32)> {
+        Ok((
+            self.get_property(partition_prop::CpuCap)?,
+            self.get_property(partition_prop::CpuWeight)?,
+            self.get_property(partition_prop::CpuReserve)?,
+        ))
+    }
+
     #[expect(clippy::missing_safety_doc)]
     pub unsafe fn register_doorbell(&self, m: &DoorbellMatch, event: RawHandle) -> Result<()> {
         unsafe {
